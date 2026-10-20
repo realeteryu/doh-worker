@@ -3,34 +3,44 @@ const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
 const CACHE_TTL = 3600 * 1000;   // 1 godzina
 const UPSTREAM_TIMEOUT = 8000;    // 8 sekund
 
-// Awaryjna lista blokad na wypadek braku łączności z GitHubem
-const FALLBACK_BLOCKLIST = new Set([
-  "doubleclick.net",
-  "googlesyndication.com",
-  "googleadservices.com",
-  "google-analytics.com",
-  "googletagmanager.com",
-  "facebook.com",
-  "facebook.net",
-  "fbcdn.net",
-  "adservice.google.com",
-  "ads.google.com",
-  "telemetry.microsoft.com",
-  "v10.events.data.microsoft.com"
-]);
-
 let blocklistSet = new Set();
 let lastFetchTime = 0;
 let blocklistETag = null;
 
-async function loadBlocklist() {
+async function loadBlocklist(env) {
   const now = Date.now();
 
-  // Jeśli bloklista jest aktualna – nic nie rób
+  // Jeśli bloklista jest w pamięci i aktualna – nic nie rób
   if (blocklistSet.size > 0 && (now - lastFetchTime) < CACHE_TTL) {
     return;
   }
 
+  // 1. GŁÓWNE ŹRÓDŁO: Cloudflare KV
+  try {
+    if (env && env.DNS_KV) {
+      const kvData = await env.DNS_KV.get("blocklist");
+      if (kvData) {
+        const lines = kvData.split('\n');
+        const newSet = new Set();
+        for (let i = 0; i < lines.length; i++) {
+          let line = lines[i].trim();
+          if (line) {
+            newSet.add(line.toLowerCase().replace(/\.$/, ''));
+          }
+        }
+        if (newSet.size > 0) {
+          blocklistSet = newSet;
+          lastFetchTime = now;
+          console.log(`Załadowano z KV: ${blocklistSet.size} domen.`);
+          return;
+        }
+      }
+    }
+  } catch (err) {
+    console.error("Błąd odczytu z KV:", err);
+  }
+
+  // 2. FALLBACK: GitHub (jeśli KV zawiodło lub jest puste)
   try {
     const headers = { "User-Agent": "doh-worker/1.0" };
     if (blocklistETag) {
@@ -40,7 +50,6 @@ async function loadBlocklist() {
     const res = await fetch(BLOCKLIST_URL, { headers });
 
     if (res.status === 304) {
-      // Lista się nie zmieniła – odśwież tylko czas, nie parsuj ponownie
       lastFetchTime = now;
       console.log("Bloklista bez zmian (304), używam poprzedniej wersji.");
       return;
@@ -71,15 +80,15 @@ async function loadBlocklist() {
     if (newSet.size > 0) {
       blocklistSet = newSet;
       lastFetchTime = now;
-      console.log(`Załadowano bloklistę: ${blocklistSet.size} domen.`);
+      console.log(`Załadowano z GitHuba: ${blocklistSet.size} domen.`);
     }
   } catch (err) {
-    console.error("Błąd podczas pobierania bloklisty:", err);
-    lastFetchTime = now; // zapobiega retry storm przy dłuższej awarii
-
+    console.error("Błąd podczas pobierania bloklisty z GitHuba:", err);
+    lastFetchTime = now; // Zapobiega retry storm
+    
+    // 3. OSTATECZNOŚĆ: Fail-Open (brak blokad, ruch idzie przez Cloudflare)
     if (blocklistSet.size === 0) {
-      blocklistSet = FALLBACK_BLOCKLIST;
-      console.log("Użyto awaryjnej listy blokad.");
+      console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
     }
   }
 }
@@ -242,9 +251,9 @@ export default {
     // Jeśli bloklista nie jest jeszcze załadowana – czekamy.
     // W przeciwnym razie odświeżamy w tle, żeby nie blokować requestu.
     if (blocklistSet.size === 0) {
-      await loadBlocklist();
+      await loadBlocklist(env);
     } else {
-      ctx.waitUntil(loadBlocklist());
+      ctx.waitUntil(loadBlocklist(env));
     }
 
     if (url.pathname === "/") {
