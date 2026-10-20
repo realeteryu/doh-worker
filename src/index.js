@@ -1,4 +1,4 @@
-const BLOCKLIST_URL = "https://raw.githubusercontent.com/Eteryu404/dns-blocklists/refs/heads/main/output/doh_combined.txt";
+const BLOCKLIST_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.txt";
 const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
 const CACHE_TTL = 3600 * 1000;   // 1 godzina
 const UPSTREAM_TIMEOUT = 8000;    // 8 sekund
