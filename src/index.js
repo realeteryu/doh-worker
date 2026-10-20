@@ -248,7 +248,7 @@ export default {
     }
 
     if (url.pathname === "/") {
-      return new Response("DoH Minimal Worker is Running!", { status: 200 });
+      return new Response("doh-worker is running.", { status: 200 });
     }
 
     if (url.pathname !== "/dns-query") {
