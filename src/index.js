@@ -10,24 +10,18 @@ let blocklistETag = null;
 async function loadBlocklist(env) {
   const now = Date.now();
 
-  // Jeśli bloklista jest w pamięci i aktualna – nic nie rób
+  // jeśli bloklista jest w pamięci i aktualna – nic nie rób
   if (blocklistSet.size > 0 && (now - lastFetchTime) < CACHE_TTL) {
     return;
   }
 
-  // 1. GŁÓWNE ŹRÓDŁO: Cloudflare KV
+  // 1. główne źródło: cloudflare kv
   try {
     if (env && env.DNS_KV) {
       const kvData = await env.DNS_KV.get("blocklist");
       if (kvData) {
-        const lines = kvData.split('\n');
-        const newSet = new Set();
-        for (let i = 0; i < lines.length; i++) {
-          let line = lines[i].trim();
-          if (line) {
-            newSet.add(line.toLowerCase().replace(/\.$/, ''));
-          }
-        }
+        // błyskawiczna optymalizacja: lista z kv jest już czysta, nie trzeba jej parsować w pętli
+        const newSet = new Set(kvData.trim().split('\n'));
         if (newSet.size > 0) {
           blocklistSet = newSet;
           lastFetchTime = now;
@@ -40,7 +34,7 @@ async function loadBlocklist(env) {
     console.error("Błąd odczytu z KV:", err);
   }
 
-  // 2. FALLBACK: GitHub (jeśli KV zawiodło lub jest puste)
+  // 2. fallback: github (jeśli kv zawiodło lub jest puste)
   try {
     const headers = { "User-Agent": "doh-worker/1.0" };
     if (blocklistETag) {
@@ -65,17 +59,9 @@ async function loadBlocklist(env) {
     }
 
     const text = await res.text();
-    const lines = text.split('\n');
-    const newSet = new Set();
-
-    for (let i = 0; i < lines.length; i++) {
-      let line = lines[i].trim();
-      if (!line || line.startsWith('#')) continue;
-      line = line.replace(/^(0\.0\.0\.0|127\.0\.0\.1)\s+/, '').split('#')[0].trim();
-      if (line) {
-        newSet.add(line.toLowerCase().replace(/\.$/, ''));
-      }
-    }
+    
+    // błyskawiczna optymalizacja: plik z gitHuba to ten sam czysty format
+    const newSet = new Set(text.trim().split('\n'));
 
     if (newSet.size > 0) {
       blocklistSet = newSet;
@@ -84,16 +70,16 @@ async function loadBlocklist(env) {
     }
   } catch (err) {
     console.error("Błąd podczas pobierania bloklisty z GitHuba:", err);
-    lastFetchTime = now; // Zapobiega retry storm
+    lastFetchTime = now; // zapobiega retry storm
     
-    // 3. OSTATECZNOŚĆ: Fail-Open (brak blokad, ruch idzie przez Cloudflare)
+    // 3. ostateczność: fail-open (brak blokad, ruch idzie przez cloudflare)
     if (blocklistSet.size === 0) {
       console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
     }
   }
 }
 
-// Sprawdzanie blokady hierarchicznie, z uwzględnieniem subdomen
+// sprawdzanie blokady hierarchicznie, z uwzględnieniem subdomen
 function isBlocked(domain, blocklist) {
   const cleanDomain = domain.toLowerCase().replace(/\.$/, '');
   if (blocklist.has(cleanDomain)) return true;
@@ -106,7 +92,7 @@ function isBlocked(domain, blocklist) {
   return false;
 }
 
-// Parser domeny z bufora DNS, z obsługą kompresji RFC 1035
+// parser domeny z bufora dns, z obsługą kompresji rfc 1035
 function extractDomainFromDNS(buffer) {
   try {
     let offset = 12;
@@ -119,7 +105,7 @@ function extractDomainFromDNS(buffer) {
 
       if (len === 0) break;
 
-      // Wskaźnik kompresji: dwa górne bity ustawione
+      // wskaźnik kompresji: dwa górne bity ustawione
       if ((len & 0xC0) === 0xC0) {
         if (offset + 1 >= buffer.byteLength) break;
         const pointer = ((len & 0x3F) << 8) | buffer[offset + 1];
@@ -140,7 +126,7 @@ function extractDomainFromDNS(buffer) {
   }
 }
 
-// Odpowiedź NXDOMAIN na podstawie zapytania binarnego
+// odpowiedź nxdomain na podstawie zapytania binarnego
 function buildNxdomainWireFormat(requestBuffer) {
   const fallback = () => new Uint8Array([
     0x00, 0x00,
@@ -164,22 +150,22 @@ function buildNxdomainWireFormat(requestBuffer) {
   }
 
   const responseBuffer = new Uint8Array(requestBuffer.slice(0));
-  // QR=1, zachowaj oryginalną flagę RD z requestu
+  // qr=1, zachowaj oryginalną flagę rd z requestu
   responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
-  responseBuffer[3] = 0x83; // RA=1, RCODE=3 (NXDOMAIN)
-  responseBuffer[6] = 0x00; responseBuffer[7] = 0x00; // ANCOUNT
-  responseBuffer[8] = 0x00; responseBuffer[9] = 0x00; // NSCOUNT
-  // ARCOUNT zostawiamy bez zmian – sekcja additional (OPT) pozostaje w buforze
+  responseBuffer[3] = 0x83; // ra=1, rcode=3 (nxdomain)
+  responseBuffer[6] = 0x00; responseBuffer[7] = 0x00; // ancount
+  responseBuffer[8] = 0x00; responseBuffer[9] = 0x00; // nscount
+  // arcount zostawiamy bez zmian – sekcja additional (opt) pozostaje w buforze
 
   return responseBuffer;
 }
 
-// Odpowiedź NXDOMAIN dla zapytań ?name=...
+// odpowiedź nxdomain dla zapytań ?name=...
 function buildNxdomainResponseForDomain(domainName, qtype = 1) {
   const cleanDomain = domainName.toLowerCase().replace(/\.$/, '');
   const rawLabels = cleanDomain ? cleanDomain.split('.') : [];
 
-  // Walidacja etykiet: 1–63 znaki
+  // walidacja etykiet: 1–63 znaki
   const labels = rawLabels.filter(l => l.length > 0 && l.length <= 63);
 
   let qnameLen = 1;
@@ -218,7 +204,7 @@ function buildNxdomainResponseForDomain(domainName, qtype = 1) {
   return responseBuffer;
 }
 
-// Fetch do upstreamu z timeoutem i filtrowaniem nagłówków
+// fetch do upstreamu z timeoutem i filtrowaniem nagłówków
 async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   const isPost = request.method === "POST";
 
@@ -248,8 +234,8 @@ export default {
     const url = new URL(request.url);
     const upstreamUrl = (env && env.UPSTREAM_DOH) ? env.UPSTREAM_DOH : DEFAULT_UPSTREAM;
 
-    // Jeśli bloklista nie jest jeszcze załadowana – czekamy.
-    // W przeciwnym razie odświeżamy w tle, żeby nie blokować requestu.
+    // jeśli bloklista nie jest jeszcze załadowana – czekamy.
+    // w przeciwnym razie odświeżamy w tle, żeby nie blokować requestu.
     if (blocklistSet.size === 0) {
       await loadBlocklist(env);
     } else {
