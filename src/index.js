@@ -20,7 +20,6 @@ async function loadBlocklist(env) {
     if (env && env.DNS_KV) {
       const kvData = await env.DNS_KV.get("blocklist");
       if (kvData) {
-        // błyskawiczna optymalizacja: lista z kv jest już czysta, nie trzeba jej parsować w pętli
         const newSet = new Set(kvData.trim().split('\n'));
         if (newSet.size > 0) {
           blocklistSet = newSet;
@@ -59,8 +58,6 @@ async function loadBlocklist(env) {
     }
 
     const text = await res.text();
-    
-    // błyskawiczna optymalizacja: plik z gitHuba to ten sam czysty format
     const newSet = new Set(text.trim().split('\n'));
 
     if (newSet.size > 0) {
@@ -70,24 +67,25 @@ async function loadBlocklist(env) {
     }
   } catch (err) {
     console.error("Błąd podczas pobierania bloklisty z GitHuba:", err);
-    lastFetchTime = now; // zapobiega retry storm
+    lastFetchTime = now; 
     
-    // 3. ostateczność: fail-open (brak blokad, ruch idzie przez cloudflare)
+    // 3. ostateczność: fail-open
     if (blocklistSet.size === 0) {
       console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
     }
   }
 }
 
-// sprawdzanie blokady hierarchicznie, z uwzględnieniem subdomen
+// sprawdzanie blokady hierarchicznie (optymalizacja: bez alokacji tablic)
 function isBlocked(domain, blocklist) {
   const cleanDomain = domain.toLowerCase().replace(/\.$/, '');
   if (blocklist.has(cleanDomain)) return true;
 
-  const parts = cleanDomain.split('.');
-  for (let i = 1; i < parts.length; i++) {
-    const parent = parts.slice(i).join('.');
+  let dotIndex = cleanDomain.indexOf('.');
+  while (dotIndex !== -1) {
+    const parent = cleanDomain.substring(dotIndex + 1);
     if (blocklist.has(parent)) return true;
+    dotIndex = cleanDomain.indexOf('.', dotIndex + 1);
   }
   return false;
 }
@@ -105,7 +103,6 @@ function extractDomainFromDNS(buffer) {
 
       if (len === 0) break;
 
-      // wskaźnik kompresji: dwa górne bity ustawione
       if ((len & 0xC0) === 0xC0) {
         if (offset + 1 >= buffer.byteLength) break;
         const pointer = ((len & 0x3F) << 8) | buffer[offset + 1];
@@ -129,12 +126,7 @@ function extractDomainFromDNS(buffer) {
 // odpowiedź nxdomain na podstawie zapytania binarnego
 function buildNxdomainWireFormat(requestBuffer) {
   const fallback = () => new Uint8Array([
-    0x00, 0x00,
-    0x81, 0x83,
-    0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00,
-    0x00, 0x00
+    0x00, 0x00, 0x81, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
   ]);
 
   if (!requestBuffer || requestBuffer.byteLength < 12) {
@@ -150,12 +142,29 @@ function buildNxdomainWireFormat(requestBuffer) {
   }
 
   const responseBuffer = new Uint8Array(requestBuffer.slice(0));
-  // qr=1, zachowaj oryginalną flagę rd z requestu
   responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
-  responseBuffer[3] = 0x83; // ra=1, rcode=3 (nxdomain)
-  responseBuffer[6] = 0x00; responseBuffer[7] = 0x00; // ancount
-  responseBuffer[8] = 0x00; responseBuffer[9] = 0x00; // nscount
-  // arcount zostawiamy bez zmian – sekcja additional (opt) pozostaje w buforze
+  responseBuffer[3] = 0x83;
+  responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
+  responseBuffer[8] = 0x00; responseBuffer[9] = 0x00;
+
+  return responseBuffer;
+}
+
+// nowa funkcja: odpowiedź servfail (gdy upstream zawiedzie)
+function buildServfailWireFormat(requestBuffer) {
+  const fallback = () => new Uint8Array([
+    0x00, 0x00, 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+  ]);
+
+  if (!requestBuffer || requestBuffer.byteLength < 12) {
+    return fallback();
+  }
+
+  const responseBuffer = new Uint8Array(requestBuffer.slice(0));
+  responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
+  responseBuffer[3] = 0x82; // ra=1, rcode=2 (servfail)
+  responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
+  responseBuffer[8] = 0x00; responseBuffer[9] = 0x00;
 
   return responseBuffer;
 }
@@ -164,8 +173,6 @@ function buildNxdomainWireFormat(requestBuffer) {
 function buildNxdomainResponseForDomain(domainName, qtype = 1) {
   const cleanDomain = domainName.toLowerCase().replace(/\.$/, '');
   const rawLabels = cleanDomain ? cleanDomain.split('.') : [];
-
-  // walidacja etykiet: 1–63 znaki
   const labels = rawLabels.filter(l => l.length > 0 && l.length <= 63);
 
   let qnameLen = 1;
@@ -176,12 +183,9 @@ function buildNxdomainResponseForDomain(domainName, qtype = 1) {
   const bufferLen = 12 + qnameLen + 4;
   const responseBuffer = new Uint8Array(bufferLen);
 
-  responseBuffer[0] = 0x00;
-  responseBuffer[1] = 0x00;
-  responseBuffer[2] = 0x81;
-  responseBuffer[3] = 0x83;
-  responseBuffer[4] = 0x00;
-  responseBuffer[5] = 0x01;
+  responseBuffer[0] = 0x00; responseBuffer[1] = 0x00;
+  responseBuffer[2] = 0x81; responseBuffer[3] = 0x83;
+  responseBuffer[4] = 0x00; responseBuffer[5] = 0x01;
 
   let offset = 12;
   for (const label of labels) {
@@ -198,8 +202,7 @@ function buildNxdomainResponseForDomain(domainName, qtype = 1) {
   responseBuffer[offset] = (qtype >> 8) & 0xFF;
   responseBuffer[offset + 1] = qtype & 0xFF;
   offset += 2;
-  responseBuffer[offset] = 0x00;
-  responseBuffer[offset + 1] = 0x01;
+  responseBuffer[offset] = 0x00; responseBuffer[offset + 1] = 0x01;
 
   return responseBuffer;
 }
@@ -207,7 +210,6 @@ function buildNxdomainResponseForDomain(domainName, qtype = 1) {
 // fetch do upstreamu z timeoutem i filtrowaniem nagłówków
 async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   const isPost = request.method === "POST";
-
   const forwardHeaders = new Headers(request.headers);
   forwardHeaders.delete("host");
   forwardHeaders.delete("cf-connecting-ip");
@@ -234,8 +236,6 @@ export default {
     const url = new URL(request.url);
     const upstreamUrl = (env && env.UPSTREAM_DOH) ? env.UPSTREAM_DOH : DEFAULT_UPSTREAM;
 
-    // jeśli bloklista nie jest jeszcze załadowana – czekamy.
-    // w przeciwnym razie odświeżamy w tle, żeby nie blokować requestu.
     if (blocklistSet.size === 0) {
       await loadBlocklist(env);
     } else {
@@ -292,10 +292,7 @@ export default {
 
       return new Response(responseBuffer, {
         status: 200,
-        headers: {
-          "Content-Type": "application/dns-message",
-          "Cache-Control": "public, max-age=300"
-        }
+        headers: { "Content-Type": "application/dns-message", "Cache-Control": "public, max-age=300" }
       });
     }
 
@@ -303,6 +300,16 @@ export default {
       return await fetchUpstream(upstreamUrl, request, queryBuffer);
     } catch (err) {
       console.error("Błąd upstreamu:", err);
+      
+      // zamiast tekstu zwracamy poprawny pakiet servfail
+      if (queryBuffer) {
+        return new Response(buildServfailWireFormat(queryBuffer), {
+          status: 200,
+          headers: { "Content-Type": "application/dns-message" }
+        });
+      }
+      
+      // dla zapytań ?name=... zwracamy standardowy błąd http
       return new Response("Bad Gateway", { status: 502 });
     }
   }
