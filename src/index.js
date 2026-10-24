@@ -1,3 +1,5 @@
+import { handleDiagnostics } from './diagnostics.js';
+
 const BLOCKLIST_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.txt";
 const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
 const CACHE_TTL = 3600 * 1000;   // 1 godzina
@@ -17,7 +19,6 @@ async function loadBlocklist(env) {
   // 1. główne źródło: cloudflare kv
   try {
     if (env && env.DNS_KV) {
-      // Dodano cacheTtl: 3600 dla lepszej wydajności odczytu
       const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
       if (kvData) {
         const newSet = new Set(kvData.trim().split('\n'));
@@ -93,7 +94,6 @@ function extractDomainFromDNS(buffer) {
     let offset = 12;
     const parts = [];
     let safety = 0;
-    // Reużycie TextDecoder dla całej pętli (mniej alokacji)
     const decoder = new TextDecoder();
 
     while (offset < buffer.byteLength && safety < 128) {
@@ -105,8 +105,7 @@ function extractDomainFromDNS(buffer) {
       if ((len & 0xC0) === 0xC0) {
         if (offset + 1 >= buffer.byteLength) break;
         const pointer = ((len & 0x3F) << 8) | buffer[offset + 1];
-        // Bezpieczeństwo RFC 9267: wskaźnik musi wskazywać na wcześniejszy bajt
-        if (pointer >= offset) break; 
+        if (pointer >= offset) break; // RFC 9267
         offset = pointer;
         continue;
       }
@@ -124,7 +123,6 @@ function extractDomainFromDNS(buffer) {
   }
 }
 
-// ... (reszta funkcji buildNxdomainWireFormat, buildServfailWireFormat, buildNxdomainResponseForDomain, fetchUpstream pozostaje bez zmian)
 function buildNxdomainWireFormat(requestBuffer) {
   const fallback = () => new Uint8Array([
     0x00, 0x00, 0x81, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -240,8 +238,13 @@ export default {
       ctx.waitUntil(loadBlocklist(env));
     }
 
+    // --- NOWY ENDPOINT DIAGNOSTYCZNY ---
+    if (url.pathname === "/test" || url.pathname === "/test.json") {
+      return handleDiagnostics(request, blocklistSet.size);
+    }
+
     if (url.pathname === "/") {
-      return new Response("doh-worker is running.", { status: 200 });
+      return new Response("doh-worker is running. Visit /test for diagnostics.", { status: 200 });
     }
 
     if (url.pathname !== "/dns-query") {
