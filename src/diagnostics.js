@@ -3,7 +3,6 @@ export function handleDiagnostics(request, blocklistSize) {
   const clientIP = request.headers.get("CF-Connecting-IP") || "nieznany";
   const country = request.headers.get("CF-IPCountry") || "nieznany";
   
-  // Dane diagnostyczne
   const diagnostics = {
     status: "ok",
     resolver: "Cloudflare (doh-worker)",
@@ -15,14 +14,12 @@ export function handleDiagnostics(request, blocklistSize) {
     timestamp: new Date().toISOString()
   };
 
-  // Endpoint JSON (np. do skryptów monitorujących)
   if (url.pathname === "/test.json") {
     return new Response(JSON.stringify(diagnostics, null, 2), {
       headers: { "Content-Type": "application/json" }
     });
   }
 
-  // Endpoint HTML
   const html = `<!DOCTYPE html>
 <html lang="pl">
 <head>
@@ -30,28 +27,36 @@ export function handleDiagnostics(request, blocklistSize) {
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Status | doh-worker</title>
   <style>
-    body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; }
-    .card { background: #1e293b; padding: 2rem; border-radius: 1rem; box-shadow: 0 4px 6px -1px rgb(0 0 0 / 0.1); max-width: 500px; width: 90%; }
-    h1 { color: #38bdf8; margin-top: 0; font-size: 1.5rem; }
-    pre { background: #0f172a; padding: 1rem; border-radius: 0.5rem; overflow-x: auto; color: #a5b4fc; font-size: 0.9em; }
-    .status { color: #4ade80; font-weight: bold; text-transform: uppercase; }
-    a { color: #38bdf8; text-decoration: none; }
+    body { 
+      background: #0a0a0a; 
+      color: #d4d4d4; 
+      font-family: monospace; 
+      padding: 24px; 
+      line-height: 1.5; 
+      font-size: 14px;
+    }
+    a { color: #3b82f6; text-decoration: none; }
     a:hover { text-decoration: underline; }
-    hr { border-color: #334155; margin: 1.5rem 0; }
+    .ok { color: #22c55e; font-weight: bold; }
+    hr { border: 0; border-top: 1px dashed #333; margin: 16px 0; }
+    pre { margin: 0; white-space: pre-wrap; word-wrap: break-word; }
   </style>
 </head>
 <body>
-  <div class="card">
-    <h1>🛡️ Diagnostyka sieci</h1>
-    <p><strong>Status:</strong> <span class="status">${diagnostics.status}</span></p>
-    <p><strong>Resolver:</strong> ${diagnostics.resolver}</p>
-    <p><strong>Twój adres IP:</strong> <code>${diagnostics.clientIP}</code></p>
-    <p><strong>Kraj:</strong> ${diagnostics.country}</p>
-    <p><strong>Załadowane domeny w pamięci:</strong> ${diagnostics.loadedDomains}</p>
-    <hr>
-    <p><strong>Format JSON:</strong> <a href="/test.json">/test.json</a></p>
-    <pre>${JSON.stringify(diagnostics, null, 2)}</pre>
-  </div>
+  <div style="color: #fff; font-weight: bold;">doh-worker / diagnostics</div>
+  <hr>
+  <pre><span style="color: #888;">status........:</span> <span class="ok">${diagnostics.status}</span>
+<span style="color: #888;">resolver......:</span> ${diagnostics.resolver}
+<span style="color: #888;">client_ip.....:</span> ${diagnostics.clientIP}
+<span style="color: #888;">country.......:</span> ${diagnostics.country}
+<span style="color: #888;">loaded_domains:</span> ${diagnostics.loadedDomains}
+<span style="color: #888;">protocol......:</span> ${diagnostics.protocol}
+<span style="color: #888;">server........:</span> ${diagnostics.server}
+<span style="color: #888;">timestamp.....:</span> ${diagnostics.timestamp}</pre>
+  <hr>
+  <div>raw_json: <a href="/test.json">/test.json</a></div>
+  <br>
+  <pre>${JSON.stringify(diagnostics, null, 2)}</pre>
 </body>
 </html>`;
 
