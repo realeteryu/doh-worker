@@ -10,7 +10,6 @@ let blocklistETag = null;
 async function loadBlocklist(env) {
   const now = Date.now();
 
-  // jeśli bloklista jest w pamięci i aktualna – nic nie rób
   if (blocklistSet.size > 0 && (now - lastFetchTime) < CACHE_TTL) {
     return;
   }
@@ -18,7 +17,8 @@ async function loadBlocklist(env) {
   // 1. główne źródło: cloudflare kv
   try {
     if (env && env.DNS_KV) {
-      const kvData = await env.DNS_KV.get("blocklist");
+      // Dodano cacheTtl: 3600 dla lepszej wydajności odczytu
+      const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
       if (kvData) {
         const newSet = new Set(kvData.trim().split('\n'));
         if (newSet.size > 0) {
@@ -33,7 +33,7 @@ async function loadBlocklist(env) {
     console.error("Błąd odczytu z KV:", err);
   }
 
-  // 2. fallback: github (jeśli kv zawiodło lub jest puste)
+  // 2. fallback: github
   try {
     const headers = { "User-Agent": "doh-worker/1.0" };
     if (blocklistETag) {
@@ -69,14 +69,12 @@ async function loadBlocklist(env) {
     console.error("Błąd podczas pobierania bloklisty z GitHuba:", err);
     lastFetchTime = now; 
     
-    // 3. ostateczność: fail-open
     if (blocklistSet.size === 0) {
       console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
     }
   }
 }
 
-// sprawdzanie blokady hierarchicznie (optymalizacja: bez alokacji tablic)
 function isBlocked(domain, blocklist) {
   const cleanDomain = domain.toLowerCase().replace(/\.$/, '');
   if (blocklist.has(cleanDomain)) return true;
@@ -90,12 +88,13 @@ function isBlocked(domain, blocklist) {
   return false;
 }
 
-// parser domeny z bufora dns, z obsługą kompresji rfc 1035
 function extractDomainFromDNS(buffer) {
   try {
     let offset = 12;
     const parts = [];
     let safety = 0;
+    // Reużycie TextDecoder dla całej pętli (mniej alokacji)
+    const decoder = new TextDecoder();
 
     while (offset < buffer.byteLength && safety < 128) {
       safety++;
@@ -106,13 +105,15 @@ function extractDomainFromDNS(buffer) {
       if ((len & 0xC0) === 0xC0) {
         if (offset + 1 >= buffer.byteLength) break;
         const pointer = ((len & 0x3F) << 8) | buffer[offset + 1];
+        // Bezpieczeństwo RFC 9267: wskaźnik musi wskazywać na wcześniejszy bajt
+        if (pointer >= offset) break; 
         offset = pointer;
         continue;
       }
 
       offset++;
       if (offset + len > buffer.byteLength) break;
-      const label = new TextDecoder().decode(buffer.subarray(offset, offset + len));
+      const label = decoder.decode(buffer.subarray(offset, offset + len));
       parts.push(label);
       offset += len;
     }
@@ -123,7 +124,7 @@ function extractDomainFromDNS(buffer) {
   }
 }
 
-// odpowiedź nxdomain na podstawie zapytania binarnego
+// ... (reszta funkcji buildNxdomainWireFormat, buildServfailWireFormat, buildNxdomainResponseForDomain, fetchUpstream pozostaje bez zmian)
 function buildNxdomainWireFormat(requestBuffer) {
   const fallback = () => new Uint8Array([
     0x00, 0x00, 0x81, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -150,7 +151,6 @@ function buildNxdomainWireFormat(requestBuffer) {
   return responseBuffer;
 }
 
-// nowa funkcja: odpowiedź servfail (gdy upstream zawiedzie)
 function buildServfailWireFormat(requestBuffer) {
   const fallback = () => new Uint8Array([
     0x00, 0x00, 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
@@ -162,14 +162,13 @@ function buildServfailWireFormat(requestBuffer) {
 
   const responseBuffer = new Uint8Array(requestBuffer.slice(0));
   responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
-  responseBuffer[3] = 0x82; // ra=1, rcode=2 (servfail)
+  responseBuffer[3] = 0x82;
   responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
   responseBuffer[8] = 0x00; responseBuffer[9] = 0x00;
 
   return responseBuffer;
 }
 
-// odpowiedź nxdomain dla zapytań ?name=...
 function buildNxdomainResponseForDomain(domainName, qtype = 1) {
   const cleanDomain = domainName.toLowerCase().replace(/\.$/, '');
   const rawLabels = cleanDomain ? cleanDomain.split('.') : [];
@@ -207,7 +206,6 @@ function buildNxdomainResponseForDomain(domainName, qtype = 1) {
   return responseBuffer;
 }
 
-// fetch do upstreamu z timeoutem i filtrowaniem nagłówków
 async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   const isPost = request.method === "POST";
   const forwardHeaders = new Headers(request.headers);
@@ -301,7 +299,6 @@ export default {
     } catch (err) {
       console.error("Błąd upstreamu:", err);
       
-      // zamiast tekstu zwracamy poprawny pakiet servfail
       if (queryBuffer) {
         return new Response(buildServfailWireFormat(queryBuffer), {
           status: 200,
@@ -309,7 +306,6 @@ export default {
         });
       }
       
-      // dla zapytań ?name=... zwracamy standardowy błąd http
       return new Response("Bad Gateway", { status: 502 });
     }
   }
