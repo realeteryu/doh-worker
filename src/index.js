@@ -6,7 +6,7 @@ const UPSTREAM_TIMEOUT = 8000;    // 8 sekund
 let blocklistSet = new Set();
 let lastFetchTime = 0;
 let blocklistETag = null;
-let isFetching = false; // Zapobiega wielokrotnemu ładowaniu naraz
+let isFetching = false;
 
 async function loadBlocklist(env) {
   const now = Date.now();
@@ -21,14 +21,8 @@ async function loadBlocklist(env) {
     if (env && env.DNS_KV) {
       const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
       if (kvData) {
-        // Optymalizacja: unikamy trim() na wielkim stringu
-        const lines = kvData.split('\n');
-        const newSet = new Set();
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i].trim();
-          if (line) newSet.add(line);
-        }
-        
+        // NAJSZYBSZA MOŻLIWA METODA W V8 (przywrócona)
+        const newSet = new Set(kvData.trim().split('\n'));
         if (newSet.size > 0) {
           blocklistSet = newSet;
           lastFetchTime = now;
@@ -59,12 +53,8 @@ async function loadBlocklist(env) {
     if (newETag) blocklistETag = newETag;
 
     const text = await res.text();
-    const lines = text.split('\n');
-    const newSet = new Set();
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (line) newSet.add(line);
-    }
+    // NAJSZYBSZA MOŻLIWA METODA W V8
+    const newSet = new Set(text.trim().split('\n'));
 
     if (newSet.size > 0) {
       blocklistSet = newSet;
@@ -239,7 +229,7 @@ export default {
     const url = new URL(request.url);
     const upstreamUrl = (env && env.UPSTREAM_DOH) ? env.UPSTREAM_DOH : DEFAULT_UPSTREAM;
 
-    // KLUCZOWA ZMIANA: Nie blokujemy żądania. Ładujemy w tle.
+    // Wywołujemy ładowanie w tle, aby nie blokować żądania
     if (blocklistSet.size === 0) {
       ctx.waitUntil(loadBlocklist(env));
     } else {
@@ -285,7 +275,6 @@ export default {
       domainName = extractDomainFromDNS(queryBuffer);
     }
 
-    // Sprawdzamy tylko jeśli lista jest już załadowana
     if (blocklistSet.size > 0 && domainName && isBlocked(domainName, blocklistSet)) {
       let responseBuffer;
       if (queryBuffer) {
