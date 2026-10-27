@@ -6,6 +6,7 @@ const UPSTREAM_TIMEOUT = 8000;    // 8 sekund
 let blocklistSet = new Set();
 let lastFetchTime = 0;
 let blocklistETag = null;
+let isFetching = false; // Zapobiega wielokrotnemu ładowaniu naraz
 
 async function loadBlocklist(env) {
   const now = Date.now();
@@ -13,14 +14,21 @@ async function loadBlocklist(env) {
   if (blocklistSet.size > 0 && (now - lastFetchTime) < CACHE_TTL) {
     return;
   }
+  if (isFetching) return;
+  isFetching = true;
 
-  // 1. główne źródło: cloudflare kv
   try {
     if (env && env.DNS_KV) {
-      // Dodano cacheTtl: 3600 dla lepszej wydajności odczytu
       const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
       if (kvData) {
-        const newSet = new Set(kvData.trim().split('\n'));
+        // Optymalizacja: unikamy trim() na wielkim stringu
+        const lines = kvData.split('\n');
+        const newSet = new Set();
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (line) newSet.add(line);
+        }
+        
         if (newSet.size > 0) {
           blocklistSet = newSet;
           lastFetchTime = now;
@@ -33,32 +41,30 @@ async function loadBlocklist(env) {
     console.error("Błąd odczytu z KV:", err);
   }
 
-  // 2. fallback: github
+  // Fallback GitHub
   try {
     const headers = { "User-Agent": "doh-worker/1.0" };
-    if (blocklistETag) {
-      headers["If-None-Match"] = blocklistETag;
-    }
+    if (blocklistETag) headers["If-None-Match"] = blocklistETag;
 
     const res = await fetch(BLOCKLIST_URL, { headers });
 
     if (res.status === 304) {
       lastFetchTime = now;
-      console.log("Bloklista bez zmian (304), używam poprzedniej wersji.");
       return;
     }
 
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
     const newETag = res.headers.get("ETag");
-    if (newETag) {
-      blocklistETag = newETag;
-    }
+    if (newETag) blocklistETag = newETag;
 
     const text = await res.text();
-    const newSet = new Set(text.trim().split('\n'));
+    const lines = text.split('\n');
+    const newSet = new Set();
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (line) newSet.add(line);
+    }
 
     if (newSet.size > 0) {
       blocklistSet = newSet;
@@ -66,17 +72,19 @@ async function loadBlocklist(env) {
       console.log(`Załadowano z GitHuba: ${blocklistSet.size} domen.`);
     }
   } catch (err) {
-    console.error("Błąd podczas pobierania bloklisty z GitHuba:", err);
+    console.error("Błąd podczas pobierania z GitHuba:", err);
     lastFetchTime = now; 
-    
-    if (blocklistSet.size === 0) {
-      console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
-    }
+  } finally {
+    isFetching = false;
   }
 }
 
 function isBlocked(domain, blocklist) {
-  const cleanDomain = domain.toLowerCase().replace(/\.$/, '');
+  let cleanDomain = domain.toLowerCase();
+  if (cleanDomain.endsWith('.')) {
+    cleanDomain = cleanDomain.slice(0, -1);
+  }
+  
   if (blocklist.has(cleanDomain)) return true;
 
   let dotIndex = cleanDomain.indexOf('.');
@@ -93,7 +101,6 @@ function extractDomainFromDNS(buffer) {
     let offset = 12;
     const parts = [];
     let safety = 0;
-    // Reużycie TextDecoder dla całej pętli (mniej alokacji)
     const decoder = new TextDecoder();
 
     while (offset < buffer.byteLength && safety < 128) {
@@ -105,7 +112,6 @@ function extractDomainFromDNS(buffer) {
       if ((len & 0xC0) === 0xC0) {
         if (offset + 1 >= buffer.byteLength) break;
         const pointer = ((len & 0x3F) << 8) | buffer[offset + 1];
-        // Bezpieczeństwo RFC 9267: wskaźnik musi wskazywać na wcześniejszy bajt
         if (pointer >= offset) break; 
         offset = pointer;
         continue;
@@ -233,8 +239,9 @@ export default {
     const url = new URL(request.url);
     const upstreamUrl = (env && env.UPSTREAM_DOH) ? env.UPSTREAM_DOH : DEFAULT_UPSTREAM;
 
+    // KLUCZOWA ZMIANA: Nie blokujemy żądania. Ładujemy w tle.
     if (blocklistSet.size === 0) {
-      await loadBlocklist(env);
+      ctx.waitUntil(loadBlocklist(env));
     } else {
       ctx.waitUntil(loadBlocklist(env));
     }
@@ -278,7 +285,8 @@ export default {
       domainName = extractDomainFromDNS(queryBuffer);
     }
 
-    if (domainName && isBlocked(domainName, blocklistSet)) {
+    // Sprawdzamy tylko jeśli lista jest już załadowana
+    if (blocklistSet.size > 0 && domainName && isBlocked(domainName, blocklistSet)) {
       let responseBuffer;
       if (queryBuffer) {
         responseBuffer = buildNxdomainWireFormat(queryBuffer);
