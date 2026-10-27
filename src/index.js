@@ -1,11 +1,15 @@
 const BLOCKLIST_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.txt";
 const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
-const CACHE_TTL = 3600 * 1000;   // 1 godzina
-const UPSTREAM_TIMEOUT = 8000;    // 8 sekund
+const CACHE_TTL = 3600 * 1000;      // 1 godzina
+const UPSTREAM_TIMEOUT = 8000;      // 8 sekund
+const UPSTREAM_CACHE_MAX_AGE = 300; // 5 minut cache'owania odpowiedzi upstreamu na krawędzi
 
 let blocklistSet = new Set();
 let lastFetchTime = 0;
 let blocklistETag = null;
+// Singleton obietnicy ładowania bloklisty - zapobiega wielokrotnym
+// odczytom KV przy równoległych żądaniach na zimnym isolate
+let blocklistPromise = null;
 
 async function loadBlocklist(env) {
   const now = Date.now();
@@ -72,6 +76,47 @@ async function loadBlocklist(env) {
     if (blocklistSet.size === 0) {
       console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
     }
+  }
+}
+
+// Zapewnia załadowanie bloklisty przy pierwszym żądaniu na isolate
+// oraz odświeżanie w tle po wygaśnięciu TTL. Dzięki singletonowi
+// wielu równoległych klientów nie wywoła wielokrotnych odczytów KV.
+async function ensureBlocklist(env, ctx) {
+  const now = Date.now();
+
+  // Bloklista w pamięci jest świeża - nic nie robimy
+  if (blocklistSet.size > 0 && (now - lastFetchTime) < CACHE_TTL) {
+    return;
+  }
+
+  // Zimny isolate lub bloklista pusta - czekamy na pierwsze załadowanie.
+  // Równoległe żądania współdzielą tę samą obietnicę (jeden odczyt KV).
+  if (blocklistSet.size === 0) {
+    if (!blocklistPromise) {
+      blocklistPromise = loadBlocklist(env)
+        .catch((err) => {
+          console.error("Nieoczekiwany błąd ładowania bloklisty:", err);
+        })
+        .finally(() => {
+          blocklistPromise = null;
+        });
+    }
+    await blocklistPromise;
+    return;
+  }
+
+  // Bloklista wygasła, ale jest używana - odświeżamy w tle,
+  // nie blokując bieżącego żądania
+  if (!blocklistPromise) {
+    blocklistPromise = loadBlocklist(env)
+      .catch((err) => {
+        console.error("Nieoczekiwany błąd odświeżania bloklisty:", err);
+      })
+      .finally(() => {
+        blocklistPromise = null;
+      });
+    ctx.waitUntil(blocklistPromise);
   }
 }
 
@@ -217,11 +262,25 @@ async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
 
   try {
-    return await fetch(upstreamUrl + new URL(request.url).search, {
+    const upstreamResponse = await fetch(upstreamUrl + new URL(request.url).search, {
       method: request.method,
       headers: forwardHeaders,
       body: isPost ? queryBuffer : null,
       signal: controller.signal
+    });
+
+    // Dodajemy Cache-Control, jeśli upstream go nie ustawił.
+    // Pozwala Cloudflare cache'ować popularne odpowiedzi DNS na krawędzi
+    // i odciążać Worker (dotyczy tylko GET; POST i tak nie jest cache'owany).
+    const newHeaders = new Headers(upstreamResponse.headers);
+    if (!newHeaders.has("Cache-Control")) {
+      newHeaders.set("Cache-Control", `public, max-age=${UPSTREAM_CACHE_MAX_AGE}`);
+    }
+
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers: newHeaders
     });
   } finally {
     clearTimeout(timeoutId);
@@ -233,12 +292,6 @@ export default {
     const url = new URL(request.url);
     const upstreamUrl = (env && env.UPSTREAM_DOH) ? env.UPSTREAM_DOH : DEFAULT_UPSTREAM;
 
-    if (blocklistSet.size === 0) {
-      await loadBlocklist(env);
-    } else {
-      ctx.waitUntil(loadBlocklist(env));
-    }
-
     if (url.pathname === "/") {
       return new Response("doh-worker is running.", { status: 200 });
     }
@@ -246,6 +299,10 @@ export default {
     if (url.pathname !== "/dns-query") {
       return new Response("Not Found", { status: 404 });
     }
+
+    // Bloklistę ładujemy dopiero dla faktycznych zapytań DNS,
+    // żeby nie zużywać CPU na health-checki i 404.
+    await ensureBlocklist(env, ctx);
 
     let domainName = "";
     let queryBuffer = null;
