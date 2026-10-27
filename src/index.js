@@ -1,82 +1,106 @@
 const BLOCKLIST_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.txt";
 const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
 const CACHE_TTL = 3600 * 1000;   // 1 godzina
+const ERROR_RETRY_TTL = 5 * 60 * 1000; // 5 minut po błędzie
 const UPSTREAM_TIMEOUT = 8000;    // 8 sekund
+const MAX_DNS_SIZE = 4096;        // 512 UDP + bufor EDNS0
 
 let blocklistSet = new Set();
-let lastFetchTime = 0;
+let nextRefreshTime = 0;
 let blocklistETag = null;
+let loadPromise = null;
+
+function normalizeDomain(d) {
+  return d.trim().toLowerCase().replace(/\.$/, '');
+}
+
+// Filtruje puste linie i komentarze – chroni przed nadpisaniem bloklisty
+function parseBlocklist(text) {
+  const set = new Set();
+  for (const rawLine of text.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith('#') || line.startsWith('//') || line.startsWith('!')) continue;
+    const d = normalizeDomain(line);
+    if (d) set.add(d);
+  }
+  return set;
+}
 
 async function loadBlocklist(env) {
-  const now = Date.now();
+  // Deduplikacja: równoległe żądania czekają na jedno pobranie
+  if (loadPromise) return loadPromise;
 
-  if (blocklistSet.size > 0 && (now - lastFetchTime) < CACHE_TTL) {
-    return;
-  }
+  loadPromise = (async () => {
+    const now = Date.now();
+    if (blocklistSet.size > 0 && now < nextRefreshTime) return;
 
-  // 1. główne źródło: cloudflare kv
-  try {
-    if (env && env.DNS_KV) {
-      // Dodano cacheTtl: 3600 dla lepszej wydajności odczytu
-      const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
-      if (kvData) {
-        const newSet = new Set(kvData.trim().split('\n'));
-        if (newSet.size > 0) {
-          blocklistSet = newSet;
-          lastFetchTime = now;
-          console.log(`Załadowano z KV: ${blocklistSet.size} domen.`);
-          return;
+    // 1. główne źródło: cloudflare kv
+    try {
+      if (env && env.DNS_KV) {
+        const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 21600 }); // 6h cache
+        if (kvData) {
+          const newSet = parseBlocklist(kvData);
+          if (newSet.size > 0) {
+            blocklistSet = newSet;
+            nextRefreshTime = now + CACHE_TTL;
+            console.log(`Załadowano z KV: ${blocklistSet.size} domen.`);
+            return;
+          }
         }
       }
+    } catch (err) {
+      console.error("Błąd odczytu z KV:", err);
     }
-  } catch (err) {
-    console.error("Błąd odczytu z KV:", err);
-  }
 
-  // 2. fallback: github
+    // 2. fallback: github
+    try {
+      const headers = { "User-Agent": "doh-worker/1.0" };
+      if (blocklistETag) headers["If-None-Match"] = blocklistETag;
+
+      const res = await fetch(BLOCKLIST_URL, { headers });
+
+      if (res.status === 304) {
+        nextRefreshTime = now + CACHE_TTL;
+        console.log("Bloklista bez zmian (304).");
+        return;
+      }
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
+      const newETag = res.headers.get("ETag");
+      if (newETag) blocklistETag = newETag;
+
+      const text = await res.text();
+      const newSet = parseBlocklist(text);
+
+      if (newSet.size > 0) {
+        blocklistSet = newSet;
+        nextRefreshTime = now + CACHE_TTL;
+        console.log(`Załadowano z GitHuba: ${blocklistSet.size} domen.`);
+      } else {
+        // Pusta lista – nie nadpisuj działającej
+        nextRefreshTime = now + ERROR_RETRY_TTL;
+      }
+    } catch (err) {
+      console.error("Błąd podczas pobierania bloklisty z GitHuba:", err);
+      nextRefreshTime = now + ERROR_RETRY_TTL;
+
+      if (blocklistSet.size === 0) {
+        console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
+      }
+    }
+  })();
+
   try {
-    const headers = { "User-Agent": "doh-worker/1.0" };
-    if (blocklistETag) {
-      headers["If-None-Match"] = blocklistETag;
-    }
-
-    const res = await fetch(BLOCKLIST_URL, { headers });
-
-    if (res.status === 304) {
-      lastFetchTime = now;
-      console.log("Bloklista bez zmian (304), używam poprzedniej wersji.");
-      return;
-    }
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-
-    const newETag = res.headers.get("ETag");
-    if (newETag) {
-      blocklistETag = newETag;
-    }
-
-    const text = await res.text();
-    const newSet = new Set(text.trim().split('\n'));
-
-    if (newSet.size > 0) {
-      blocklistSet = newSet;
-      lastFetchTime = now;
-      console.log(`Załadowano z GitHuba: ${blocklistSet.size} domen.`);
-    }
-  } catch (err) {
-    console.error("Błąd podczas pobierania bloklisty z GitHuba:", err);
-    lastFetchTime = now; 
-    
-    if (blocklistSet.size === 0) {
-      console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
-    }
+    await loadPromise;
+  } finally {
+    loadPromise = null;
   }
 }
 
 function isBlocked(domain, blocklist) {
-  const cleanDomain = domain.toLowerCase().replace(/\.$/, '');
+  const cleanDomain = normalizeDomain(domain);
   if (blocklist.has(cleanDomain)) return true;
 
   let dotIndex = cleanDomain.indexOf('.');
@@ -105,8 +129,8 @@ function extractDomainFromDNS(buffer) {
       if ((len & 0xC0) === 0xC0) {
         if (offset + 1 >= buffer.byteLength) break;
         const pointer = ((len & 0x3F) << 8) | buffer[offset + 1];
-        // Bezpieczeństwo RFC 9267: wskaźnik musi wskazywać na wcześniejszy bajt
-        if (pointer >= offset) break; 
+        // Bezpieczeństwo: wskaźnik musi wskazywać na wcześniejszy bajt
+        if (pointer >= offset) break;
         offset = pointer;
         continue;
       }
@@ -129,9 +153,7 @@ function buildNxdomainWireFormat(requestBuffer) {
     0x00, 0x00, 0x81, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
   ]);
 
-  if (!requestBuffer || requestBuffer.byteLength < 12) {
-    return fallback();
-  }
+  if (!requestBuffer || requestBuffer.byteLength < 12) return fallback();
 
   const qdcount = (requestBuffer[4] << 8) | requestBuffer[5];
   if (qdcount === 0 || requestBuffer.byteLength < 17) {
@@ -141,11 +163,13 @@ function buildNxdomainWireFormat(requestBuffer) {
     return buf;
   }
 
-  const responseBuffer = new Uint8Array(requestBuffer.slice(0));
+  // Jedna kopia bufora (bez slice)
+  const responseBuffer = new Uint8Array(requestBuffer);
   responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
   responseBuffer[3] = 0x83;
   responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
   responseBuffer[8] = 0x00; responseBuffer[9] = 0x00;
+  // ARCOUNT bez zmian – zachowuje OPT/EDNS0
 
   return responseBuffer;
 }
@@ -155,11 +179,9 @@ function buildServfailWireFormat(requestBuffer) {
     0x00, 0x00, 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
   ]);
 
-  if (!requestBuffer || requestBuffer.byteLength < 12) {
-    return fallback();
-  }
+  if (!requestBuffer || requestBuffer.byteLength < 12) return fallback();
 
-  const responseBuffer = new Uint8Array(requestBuffer.slice(0));
+  const responseBuffer = new Uint8Array(requestBuffer);
   responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
   responseBuffer[3] = 0x82;
   responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
@@ -169,38 +191,36 @@ function buildServfailWireFormat(requestBuffer) {
 }
 
 function buildNxdomainResponseForDomain(domainName, qtype = 1) {
-  const cleanDomain = domainName.toLowerCase().replace(/\.$/, '');
+  const cleanDomain = normalizeDomain(domainName);
   const rawLabels = cleanDomain ? cleanDomain.split('.') : [];
-  const labels = rawLabels.filter(l => l.length > 0 && l.length <= 63);
+  // TextEncoder zamiast charCodeAt – poprawne znaki wielobajtowe
+  const encoder = new TextEncoder();
+  const labels = [];
+
+  for (const l of rawLabels) {
+    if (!l) continue;
+    const bytes = encoder.encode(l);
+    if (bytes.length > 0 && bytes.length <= 63) labels.push(bytes);
+  }
 
   let qnameLen = 1;
-  for (const label of labels) {
-    qnameLen += label.length + 1;
-  }
+  for (const b of labels) qnameLen += b.length + 1;
 
-  const bufferLen = 12 + qnameLen + 4;
-  const responseBuffer = new Uint8Array(bufferLen);
-
-  responseBuffer[0] = 0x00; responseBuffer[1] = 0x00;
+  const responseBuffer = new Uint8Array(12 + qnameLen + 4);
   responseBuffer[2] = 0x81; responseBuffer[3] = 0x83;
-  responseBuffer[4] = 0x00; responseBuffer[5] = 0x01;
+  responseBuffer[5] = 0x01;
 
   let offset = 12;
-  for (const label of labels) {
-    responseBuffer[offset] = label.length;
-    offset++;
-    for (let i = 0; i < label.length; i++) {
-      responseBuffer[offset] = label.charCodeAt(i);
-      offset++;
-    }
+  for (const b of labels) {
+    responseBuffer[offset++] = b.length;
+    responseBuffer.set(b, offset);
+    offset += b.length;
   }
-  responseBuffer[offset] = 0x00;
-  offset++;
-
-  responseBuffer[offset] = (qtype >> 8) & 0xFF;
-  responseBuffer[offset + 1] = qtype & 0xFF;
-  offset += 2;
-  responseBuffer[offset] = 0x00; responseBuffer[offset + 1] = 0x01;
+  responseBuffer[offset++] = 0x00;
+  responseBuffer[offset++] = (qtype >> 8) & 0xFF;
+  responseBuffer[offset++] = qtype & 0xFF;
+  responseBuffer[offset++] = 0x00;
+  responseBuffer[offset++] = 0x01;
 
   return responseBuffer;
 }
@@ -212,6 +232,12 @@ async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   forwardHeaders.delete("cf-connecting-ip");
   forwardHeaders.delete("cf-ray");
   forwardHeaders.delete("cf-ipcountry");
+
+  // GET nie ma ciała – usuń nagłówki Content-*
+  if (!isPost) {
+    forwardHeaders.delete("content-type");
+    forwardHeaders.delete("content-length");
+  }
 
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
@@ -228,14 +254,30 @@ async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   }
 }
 
+// 1 retry przy 5xx / timeout (4xx zwracamy od razu)
+async function fetchUpstreamWithRetry(upstreamUrl, request, queryBuffer, retries = 1) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const res = await fetchUpstream(upstreamUrl, request, queryBuffer);
+      if (res.status < 500) return res;
+      lastErr = new Error(`HTTP ${res.status}`);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const upstreamUrl = (env && env.UPSTREAM_DOH) ? env.UPSTREAM_DOH : DEFAULT_UPSTREAM;
 
+    // Ładuj bloklistę tylko gdy pusta lub po TTL
     if (blocklistSet.size === 0) {
       await loadBlocklist(env);
-    } else {
+    } else if (Date.now() >= nextRefreshTime) {
       ctx.waitUntil(loadBlocklist(env));
     }
 
@@ -245,6 +287,13 @@ export default {
 
     if (url.pathname !== "/dns-query") {
       return new Response("Not Found", { status: 404 });
+    }
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: { "Allow": "GET, POST, OPTIONS", "Access-Control-Max-Age": "86400" }
+      });
     }
 
     let domainName = "";
@@ -271,7 +320,15 @@ export default {
       const arrayBuffer = await request.arrayBuffer();
       queryBuffer = new Uint8Array(arrayBuffer);
     } else {
-      return new Response("Method Not Allowed", { status: 405 });
+      return new Response("Method Not Allowed", {
+        status: 405,
+        headers: { "Allow": "GET, POST, OPTIONS" }
+      });
+    }
+
+    // Odrzuć zbyt duże zapytania (ochrona pamięci)
+    if (queryBuffer && queryBuffer.byteLength > MAX_DNS_SIZE) {
+      return new Response("DNS query too large", { status: 400 });
     }
 
     if (queryBuffer) {
@@ -294,17 +351,17 @@ export default {
     }
 
     try {
-      return await fetchUpstream(upstreamUrl, request, queryBuffer);
+      return await fetchUpstreamWithRetry(upstreamUrl, request, queryBuffer);
     } catch (err) {
       console.error("Błąd upstreamu:", err);
-      
+
       if (queryBuffer) {
         return new Response(buildServfailWireFormat(queryBuffer), {
           status: 200,
-          headers: { "Content-Type": "application/dns-message" }
+          headers: { "Content-Type": "application/dns-message", "Cache-Control": "no-store" }
         });
       }
-      
+
       return new Response("Bad Gateway", { status: 502 });
     }
   }
