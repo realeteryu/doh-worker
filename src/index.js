@@ -1,17 +1,11 @@
 const BLOCKLIST_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.txt";
 const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
-const CACHE_TTL = 3600 * 1000;      // 1 godzina
-const UPSTREAM_TIMEOUT = 8000;      // 8 sekund
-const UPSTREAM_CACHE_MAX_AGE = 300; // 5 minut cache na krawędzi
-
-const RCODE_SERVFAIL = 0x82;
-const RCODE_NXDOMAIN = 0x83;
+const CACHE_TTL = 3600 * 1000;   // 1 godzina
+const UPSTREAM_TIMEOUT = 8000;    // 8 sekund
 
 let blocklistSet = new Set();
 let lastFetchTime = 0;
 let blocklistETag = null;
-// singleton obietnicy ładowania - jeden odczyt kv na zimnym isolate
-let blocklistPromise = null;
 
 async function loadBlocklist(env) {
   const now = Date.now();
@@ -23,7 +17,7 @@ async function loadBlocklist(env) {
   // 1. główne źródło: cloudflare kv
   try {
     if (env && env.DNS_KV) {
-      // cacheTtl: 3600 dla lepszej wydajności odczytu
+      // Dodano cacheTtl: 3600 dla lepszej wydajności odczytu
       const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
       if (kvData) {
         const newSet = new Set(kvData.trim().split('\n'));
@@ -81,42 +75,6 @@ async function loadBlocklist(env) {
   }
 }
 
-// pierwsze ładowanie blokuje, odświeżanie po ttl idzie w tle
-async function ensureBlocklist(env, ctx) {
-  const now = Date.now();
-
-  if (blocklistSet.size > 0 && (now - lastFetchTime) < CACHE_TTL) {
-    return;
-  }
-
-  // zimny isolate - czekamy, równoległe żądania dzielą jedną obietnicę
-  if (blocklistSet.size === 0) {
-    if (!blocklistPromise) {
-      blocklistPromise = loadBlocklist(env)
-        .catch((err) => {
-          console.error("Nieoczekiwany błąd ładowania bloklisty:", err);
-        })
-        .finally(() => {
-          blocklistPromise = null;
-        });
-    }
-    await blocklistPromise;
-    return;
-  }
-
-  // ttl wygasł, ale mamy starą listę - odświeżamy bez blokowania
-  if (!blocklistPromise) {
-    blocklistPromise = loadBlocklist(env)
-      .catch((err) => {
-        console.error("Nieoczekiwany błąd odświeżania bloklisty:", err);
-      })
-      .finally(() => {
-        blocklistPromise = null;
-      });
-    ctx.waitUntil(blocklistPromise);
-  }
-}
-
 function isBlocked(domain, blocklist) {
   const cleanDomain = domain.toLowerCase().replace(/\.$/, '');
   if (blocklist.has(cleanDomain)) return true;
@@ -135,7 +93,7 @@ function extractDomainFromDNS(buffer) {
     let offset = 12;
     const parts = [];
     let safety = 0;
-    // reużycie TextDecoder dla całej pętli (mniej alokacji)
+    // Reużycie TextDecoder dla całej pętli (mniej alokacji)
     const decoder = new TextDecoder();
 
     while (offset < buffer.byteLength && safety < 128) {
@@ -147,7 +105,7 @@ function extractDomainFromDNS(buffer) {
       if ((len & 0xC0) === 0xC0) {
         if (offset + 1 >= buffer.byteLength) break;
         const pointer = ((len & 0x3F) << 8) | buffer[offset + 1];
-        // rfc 9267: wskaźnik musi wskazywać na wcześniejszy bajt
+        // Bezpieczeństwo RFC 9267: wskaźnik musi wskazywać na wcześniejszy bajt
         if (pointer >= offset) break; 
         offset = pointer;
         continue;
@@ -166,10 +124,9 @@ function extractDomainFromDNS(buffer) {
   }
 }
 
-// buduje odpowiedź błędu dns w formacie wire dla podanego rcode
-function buildErrorResponse(requestBuffer, rcode) {
+function buildNxdomainWireFormat(requestBuffer) {
   const fallback = () => new Uint8Array([
-    0x00, 0x00, 0x81, rcode, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    0x00, 0x00, 0x81, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
   ]);
 
   if (!requestBuffer || requestBuffer.byteLength < 12) {
@@ -186,7 +143,25 @@ function buildErrorResponse(requestBuffer, rcode) {
 
   const responseBuffer = new Uint8Array(requestBuffer.slice(0));
   responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
-  responseBuffer[3] = rcode;
+  responseBuffer[3] = 0x83;
+  responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
+  responseBuffer[8] = 0x00; responseBuffer[9] = 0x00;
+
+  return responseBuffer;
+}
+
+function buildServfailWireFormat(requestBuffer) {
+  const fallback = () => new Uint8Array([
+    0x00, 0x00, 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+  ]);
+
+  if (!requestBuffer || requestBuffer.byteLength < 12) {
+    return fallback();
+  }
+
+  const responseBuffer = new Uint8Array(requestBuffer.slice(0));
+  responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
+  responseBuffer[3] = 0x82;
   responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
   responseBuffer[8] = 0x00; responseBuffer[9] = 0x00;
 
@@ -242,23 +217,11 @@ async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   const timeoutId = setTimeout(() => controller.abort(), UPSTREAM_TIMEOUT);
 
   try {
-    const upstreamResponse = await fetch(upstreamUrl + new URL(request.url).search, {
+    return await fetch(upstreamUrl + new URL(request.url).search, {
       method: request.method,
       headers: forwardHeaders,
       body: isPost ? queryBuffer : null,
       signal: controller.signal
-    });
-
-    // dodajemy cache-control jeśli upstream go nie ustawił (tylko get)
-    const newHeaders = new Headers(upstreamResponse.headers);
-    if (!newHeaders.has("Cache-Control")) {
-      newHeaders.set("Cache-Control", `public, max-age=${UPSTREAM_CACHE_MAX_AGE}`);
-    }
-
-    return new Response(upstreamResponse.body, {
-      status: upstreamResponse.status,
-      statusText: upstreamResponse.statusText,
-      headers: newHeaders
     });
   } finally {
     clearTimeout(timeoutId);
@@ -270,6 +233,12 @@ export default {
     const url = new URL(request.url);
     const upstreamUrl = (env && env.UPSTREAM_DOH) ? env.UPSTREAM_DOH : DEFAULT_UPSTREAM;
 
+    if (blocklistSet.size === 0) {
+      await loadBlocklist(env);
+    } else {
+      ctx.waitUntil(loadBlocklist(env));
+    }
+
     if (url.pathname === "/") {
       return new Response("doh-worker is running.", { status: 200 });
     }
@@ -277,9 +246,6 @@ export default {
     if (url.pathname !== "/dns-query") {
       return new Response("Not Found", { status: 404 });
     }
-
-    // ładujemy bloklistę dopiero dla faktycznych zapytań dns
-    await ensureBlocklist(env, ctx);
 
     let domainName = "";
     let queryBuffer = null;
@@ -315,7 +281,7 @@ export default {
     if (domainName && isBlocked(domainName, blocklistSet)) {
       let responseBuffer;
       if (queryBuffer) {
-        responseBuffer = buildErrorResponse(queryBuffer, RCODE_NXDOMAIN);
+        responseBuffer = buildNxdomainWireFormat(queryBuffer);
       } else {
         const typeParam = parseInt(url.searchParams.get("type")) || 1;
         responseBuffer = buildNxdomainResponseForDomain(domainName, typeParam);
@@ -333,7 +299,7 @@ export default {
       console.error("Błąd upstreamu:", err);
       
       if (queryBuffer) {
-        return new Response(buildErrorResponse(queryBuffer, RCODE_SERVFAIL), {
+        return new Response(buildServfailWireFormat(queryBuffer), {
           status: 200,
           headers: { "Content-Type": "application/dns-message" }
         });
