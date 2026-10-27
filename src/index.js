@@ -6,7 +6,6 @@ const UPSTREAM_TIMEOUT = 8000;    // 8 sekund
 let blocklistSet = new Set();
 let lastFetchTime = 0;
 let blocklistETag = null;
-let isFetching = false; // Flaga zapobiegająca wielokrotnemu ładowaniu naraz
 
 async function loadBlocklist(env) {
   const now = Date.now();
@@ -15,22 +14,13 @@ async function loadBlocklist(env) {
     return;
   }
 
-  if (isFetching) return;
-  isFetching = true;
-
   // 1. główne źródło: cloudflare kv
   try {
     if (env && env.DNS_KV) {
       // Dodano cacheTtl: 3600 dla lepszej wydajności odczytu
       const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
       if (kvData) {
-        const lines = kvData.split('\n');
-        const newSet = new Set();
-        for (let i = 0; i < lines.length; i++) {
-          const line = lines[i].trim();
-          if (line) newSet.add(line);
-        }
-        
+        const newSet = new Set(kvData.trim().split('\n'));
         if (newSet.size > 0) {
           blocklistSet = newSet;
           lastFetchTime = now;
@@ -68,12 +58,7 @@ async function loadBlocklist(env) {
     }
 
     const text = await res.text();
-    const lines = text.split('\n');
-    const newSet = new Set();
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i].trim();
-      if (line) newSet.add(line);
-    }
+    const newSet = new Set(text.trim().split('\n'));
 
     if (newSet.size > 0) {
       blocklistSet = newSet;
@@ -87,17 +72,11 @@ async function loadBlocklist(env) {
     if (blocklistSet.size === 0) {
       console.log("Brak dostępnych źródeł blokad. Worker działa w trybie Fail-Open.");
     }
-  } finally {
-    isFetching = false;
   }
 }
 
 function isBlocked(domain, blocklist) {
-  let cleanDomain = domain.toLowerCase();
-  if (cleanDomain.endsWith('.')) {
-    cleanDomain = cleanDomain.slice(0, -1);
-  }
-  
+  const cleanDomain = domain.toLowerCase().replace(/\.$/, '');
   if (blocklist.has(cleanDomain)) return true;
 
   let dotIndex = cleanDomain.indexOf('.');
@@ -254,10 +233,8 @@ export default {
     const url = new URL(request.url);
     const upstreamUrl = (env && env.UPSTREAM_DOH) ? env.UPSTREAM_DOH : DEFAULT_UPSTREAM;
 
-    // Zmiana: Wywołujemy ładowanie w tle (ctx.waitUntil), aby nie blokować żądania.
-    // Jeśli lista jest pusta, pierwsze zapytanie poleci do czystego Cloudflare.
     if (blocklistSet.size === 0) {
-      ctx.waitUntil(loadBlocklist(env));
+      await loadBlocklist(env);
     } else {
       ctx.waitUntil(loadBlocklist(env));
     }
@@ -301,8 +278,7 @@ export default {
       domainName = extractDomainFromDNS(queryBuffer);
     }
 
-    // Sprawdzamy blokadę tylko jeśli lista zdążyła się załadować w tle
-    if (blocklistSet.size > 0 && domainName && isBlocked(domainName, blocklistSet)) {
+    if (domainName && isBlocked(domainName, blocklistSet)) {
       let responseBuffer;
       if (queryBuffer) {
         responseBuffer = buildNxdomainWireFormat(queryBuffer);
