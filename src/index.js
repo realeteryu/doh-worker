@@ -2,13 +2,12 @@ const BLOCKLIST_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklis
 const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
 const CACHE_TTL = 3600 * 1000;      // 1 godzina
 const UPSTREAM_TIMEOUT = 8000;      // 8 sekund
-const UPSTREAM_CACHE_MAX_AGE = 300; // 5 minut cache'owania odpowiedzi upstreamu na krawędzi
+const UPSTREAM_CACHE_MAX_AGE = 300; // 5 minut cache na krawędzi
 
 let blocklistSet = new Set();
 let lastFetchTime = 0;
 let blocklistETag = null;
-// Singleton obietnicy ładowania bloklisty - zapobiega wielokrotnym
-// odczytom KV przy równoległych żądaniach na zimnym isolate
+// singleton obietnicy ładowania - jeden odczyt kv na zimnym isolate
 let blocklistPromise = null;
 
 async function loadBlocklist(env) {
@@ -21,7 +20,7 @@ async function loadBlocklist(env) {
   // 1. główne źródło: cloudflare kv
   try {
     if (env && env.DNS_KV) {
-      // Dodano cacheTtl: 3600 dla lepszej wydajności odczytu
+      // cacheTtl: 3600 dla lepszej wydajności odczytu
       const kvData = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
       if (kvData) {
         const newSet = new Set(kvData.trim().split('\n'));
@@ -79,19 +78,15 @@ async function loadBlocklist(env) {
   }
 }
 
-// Zapewnia załadowanie bloklisty przy pierwszym żądaniu na isolate
-// oraz odświeżanie w tle po wygaśnięciu TTL. Dzięki singletonowi
-// wielu równoległych klientów nie wywoła wielokrotnych odczytów KV.
+// pierwsze ładowanie blokuje, odświeżanie po ttl idzie w tle
 async function ensureBlocklist(env, ctx) {
   const now = Date.now();
 
-  // Bloklista w pamięci jest świeża - nic nie robimy
   if (blocklistSet.size > 0 && (now - lastFetchTime) < CACHE_TTL) {
     return;
   }
 
-  // Zimny isolate lub bloklista pusta - czekamy na pierwsze załadowanie.
-  // Równoległe żądania współdzielą tę samą obietnicę (jeden odczyt KV).
+  // zimny isolate - czekamy, równoległe żądania dzielą jedną obietnicę
   if (blocklistSet.size === 0) {
     if (!blocklistPromise) {
       blocklistPromise = loadBlocklist(env)
@@ -106,8 +101,7 @@ async function ensureBlocklist(env, ctx) {
     return;
   }
 
-  // Bloklista wygasła, ale jest używana - odświeżamy w tle,
-  // nie blokując bieżącego żądania
+  // ttl wygasł, ale mamy starą listę - odświeżamy bez blokowania
   if (!blocklistPromise) {
     blocklistPromise = loadBlocklist(env)
       .catch((err) => {
@@ -138,7 +132,7 @@ function extractDomainFromDNS(buffer) {
     let offset = 12;
     const parts = [];
     let safety = 0;
-    // Reużycie TextDecoder dla całej pętli (mniej alokacji)
+    // reużycie TextDecoder dla całej pętli (mniej alokacji)
     const decoder = new TextDecoder();
 
     while (offset < buffer.byteLength && safety < 128) {
@@ -150,7 +144,7 @@ function extractDomainFromDNS(buffer) {
       if ((len & 0xC0) === 0xC0) {
         if (offset + 1 >= buffer.byteLength) break;
         const pointer = ((len & 0x3F) << 8) | buffer[offset + 1];
-        // Bezpieczeństwo RFC 9267: wskaźnik musi wskazywać na wcześniejszy bajt
+        // rfc 9267: wskaźnik musi wskazywać na wcześniejszy bajt
         if (pointer >= offset) break; 
         offset = pointer;
         continue;
@@ -269,9 +263,7 @@ async function fetchUpstream(upstreamUrl, request, queryBuffer) {
       signal: controller.signal
     });
 
-    // Dodajemy Cache-Control, jeśli upstream go nie ustawił.
-    // Pozwala Cloudflare cache'ować popularne odpowiedzi DNS na krawędzi
-    // i odciążać Worker (dotyczy tylko GET; POST i tak nie jest cache'owany).
+    // dodajemy cache-control jeśli upstream go nie ustawił (tylko get)
     const newHeaders = new Headers(upstreamResponse.headers);
     if (!newHeaders.has("Cache-Control")) {
       newHeaders.set("Cache-Control", `public, max-age=${UPSTREAM_CACHE_MAX_AGE}`);
@@ -300,8 +292,7 @@ export default {
       return new Response("Not Found", { status: 404 });
     }
 
-    // Bloklistę ładujemy dopiero dla faktycznych zapytań DNS,
-    // żeby nie zużywać CPU na health-checki i 404.
+    // ładujemy bloklistę dopiero dla faktycznych zapytań dns
     await ensureBlocklist(env, ctx);
 
     let domainName = "";
