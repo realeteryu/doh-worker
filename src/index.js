@@ -4,6 +4,9 @@ const CACHE_TTL = 3600 * 1000;      // 1 godzina
 const UPSTREAM_TIMEOUT = 8000;      // 8 sekund
 const UPSTREAM_CACHE_MAX_AGE = 300; // 5 minut cache na krawędzi
 
+const RCODE_SERVFAIL = 0x82;
+const RCODE_NXDOMAIN = 0x83;
+
 let blocklistSet = new Set();
 let lastFetchTime = 0;
 let blocklistETag = null;
@@ -163,9 +166,10 @@ function extractDomainFromDNS(buffer) {
   }
 }
 
-function buildNxdomainWireFormat(requestBuffer) {
+// buduje odpowiedź błędu dns w formacie wire dla podanego rcode
+function buildErrorResponse(requestBuffer, rcode) {
   const fallback = () => new Uint8Array([
-    0x00, 0x00, 0x81, 0x83, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+    0x00, 0x00, 0x81, rcode, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
   ]);
 
   if (!requestBuffer || requestBuffer.byteLength < 12) {
@@ -182,25 +186,7 @@ function buildNxdomainWireFormat(requestBuffer) {
 
   const responseBuffer = new Uint8Array(requestBuffer.slice(0));
   responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
-  responseBuffer[3] = 0x83;
-  responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
-  responseBuffer[8] = 0x00; responseBuffer[9] = 0x00;
-
-  return responseBuffer;
-}
-
-function buildServfailWireFormat(requestBuffer) {
-  const fallback = () => new Uint8Array([
-    0x00, 0x00, 0x81, 0x82, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-  ]);
-
-  if (!requestBuffer || requestBuffer.byteLength < 12) {
-    return fallback();
-  }
-
-  const responseBuffer = new Uint8Array(requestBuffer.slice(0));
-  responseBuffer[2] = (requestBuffer[2] & 0x01) | 0x80;
-  responseBuffer[3] = 0x82;
+  responseBuffer[3] = rcode;
   responseBuffer[6] = 0x00; responseBuffer[7] = 0x00;
   responseBuffer[8] = 0x00; responseBuffer[9] = 0x00;
 
@@ -329,7 +315,7 @@ export default {
     if (domainName && isBlocked(domainName, blocklistSet)) {
       let responseBuffer;
       if (queryBuffer) {
-        responseBuffer = buildNxdomainWireFormat(queryBuffer);
+        responseBuffer = buildErrorResponse(queryBuffer, RCODE_NXDOMAIN);
       } else {
         const typeParam = parseInt(url.searchParams.get("type")) || 1;
         responseBuffer = buildNxdomainResponseForDomain(domainName, typeParam);
@@ -347,7 +333,7 @@ export default {
       console.error("Błąd upstreamu:", err);
       
       if (queryBuffer) {
-        return new Response(buildServfailWireFormat(queryBuffer), {
+        return new Response(buildErrorResponse(queryBuffer, RCODE_SERVFAIL), {
           status: 200,
           headers: { "Content-Type": "application/dns-message" }
         });
