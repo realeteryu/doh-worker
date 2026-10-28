@@ -16,11 +16,19 @@ function normalizeDomain(d) {
 // Filtruje puste linie i komentarze – chroni przed nadpisaniem bloklisty
 function parseBlocklist(text) {
   const set = new Set();
-  for (const line of text.split('\n')) {
-    const l = line.trim();
-    if (!l || l[0] === '#' || l[0] === '!' || l.startsWith('//')) continue;
-    const d = normalizeDomain(l);
-    if (d) set.add(d);
+  const lines = text.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line) continue;
+    const c = line.charCodeAt(0);
+    if (c === 35 || c === 33) continue;                 // # lub !
+    if (c === 47 && line.charCodeAt(1) === 47) continue; // //
+    const lower = line.toLowerCase();
+    if (lower.charCodeAt(lower.length - 1) === 46) {
+      if (lower.length > 1) set.add(lower.slice(0, -1)); // usuń końcową kropkę
+    } else {
+      set.add(lower);
+    }
   }
   return set;
 }
