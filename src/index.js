@@ -204,8 +204,11 @@ export default {
     if (url.pathname === "/") return new Response("doh-worker is running.");
     if (url.pathname !== "/dns-query") return new Response("Not Found", { status: 404 });
 
-    // fail-open: ładuj listę w tle, nie blokuj żądania na cold start
-    if (blocklistSet.size === 0 || Date.now() >= nextRefreshTime) {
+    // pierwsze ładowanie: czekaj (bez tego przeglądarka cache'uje nieprzefiltrowane odpowiedzi)
+    // po załadowaniu: odświeżaj w tle
+    if (blocklistSet.size === 0) {
+      await loadBlocklist(env);
+    } else if (Date.now() >= nextRefreshTime) {
       ctx.waitUntil(loadBlocklist(env));
     }
 
