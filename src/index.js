@@ -10,6 +10,7 @@ const MAX_DNS_SIZE = 4096;             // 512 UDP + bufor EDNS0
 let blocklistSet = new Set();
 let nextRefreshTime = 0;
 let loadPromise = null;
+const textDecoder = new TextDecoder();
 
 function normalizeDomain(d) {
   return d.trim().toLowerCase().replace(/\.$/, '');
@@ -21,7 +22,9 @@ async function loadBlocklist(env) {
 
   loadPromise = (async () => {
     const now = Date.now();
-    if (blocklistSet.size > 0 && now < nextRefreshTime) return;
+
+    // blokuj ponowne próby w oknie błędu (bez tego: retry storm)
+    if (now < nextRefreshTime) return;
 
     // 1. cloudflare kv (bin)
     try {
@@ -87,7 +90,6 @@ function extractDomainFromDNS(buffer) {
     let offset = 12;
     const parts = [];
     let safety = 0;
-    const decoder = new TextDecoder();
     while (offset < buffer.byteLength && safety < 128) {
       safety++;
       const len = buffer[offset];
@@ -101,7 +103,7 @@ function extractDomainFromDNS(buffer) {
       }
       offset++;
       if (offset + len > buffer.byteLength) break;
-      parts.push(decoder.decode(buffer.subarray(offset, offset + len)));
+      parts.push(textDecoder.decode(buffer.subarray(offset, offset + len)));
       offset += len;
     }
     return parts.join('.');
@@ -199,12 +201,13 @@ export default {
     const url = new URL(request.url);
     const upstream = env?.UPSTREAM_DOH || DEFAULT_UPSTREAM;
 
-    // Ładuj bloklistę tylko gdy pusta lub po TTL
-    if (blocklistSet.size === 0) await loadBlocklist(env);
-    else if (Date.now() >= nextRefreshTime) ctx.waitUntil(loadBlocklist(env));
-
     if (url.pathname === "/") return new Response("doh-worker is running.");
     if (url.pathname !== "/dns-query") return new Response("Not Found", { status: 404 });
+
+    // fail-open: ładuj listę w tle, nie blokuj żądania na cold start
+    if (blocklistSet.size === 0 || Date.now() >= nextRefreshTime) {
+      ctx.waitUntil(loadBlocklist(env));
+    }
 
     let domainName = "";
     let queryBuffer = null;
