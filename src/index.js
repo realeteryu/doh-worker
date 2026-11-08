@@ -1,7 +1,7 @@
 import { decode } from '@msgpack/msgpack';
 
 const BLOCKLIST_BIN_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.msgpack";
-const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
+const DEFAULT_UPSTREAM = "https://dns.quad9.net/dns-query";
 const CACHE_TTL = 3600 * 1000;         // 1 godzina
 const ERROR_RETRY_TTL = 5 * 60 * 1000; // 5 minut po błędzie
 const UPSTREAM_TIMEOUT = 8000;         // 8 sekund
