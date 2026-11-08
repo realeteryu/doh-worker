@@ -1,4 +1,6 @@
-const BLOCKLIST_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.txt";
+import { decode } from '@msgpack/msgpack';
+
+const BLOCKLIST_BIN_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.msgpack";
 const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
 const CACHE_TTL = 3600 * 1000;         // 1 godzina
 const ERROR_RETRY_TTL = 5 * 60 * 1000; // 5 minut po błędzie
@@ -13,67 +15,51 @@ function normalizeDomain(d) {
   return d.trim().toLowerCase().replace(/\.$/, '');
 }
 
-// Filtruje puste linie i komentarze – chroni przed nadpisaniem bloklisty
-function parseBlocklist(text) {
-  const set = new Set();
-  const lines = text.split('\n');
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (!line) continue;
-    const c = line.charCodeAt(0);
-    if (c === 35 || c === 33) continue;                 // # lub !
-    if (c === 47 && line.charCodeAt(1) === 47) continue; // //
-    const lower = line.toLowerCase();
-    if (lower.charCodeAt(lower.length - 1) === 46) {
-      if (lower.length > 1) set.add(lower.slice(0, -1)); // usuń końcową kropkę
-    } else {
-      set.add(lower);
-    }
-  }
-  return set;
-}
-
 async function loadBlocklist(env) {
-  // Deduplikacja: równoległe żądania czekają na jedno pobranie
+  // deduplikacja
   if (loadPromise) return loadPromise;
 
   loadPromise = (async () => {
     const now = Date.now();
     if (blocklistSet.size > 0 && now < nextRefreshTime) return;
 
-    // 1. cloudflare kv
+    // 1. cloudflare kv (bin)
     try {
       if (env?.DNS_KV) {
-        const data = await env.DNS_KV.get("blocklist", { cacheTtl: 3600 });
-        if (data) {
-          const set = parseBlocklist(data);
+        const buffer = await env.DNS_KV.get("blocklist_bin", { type: "arrayBuffer", cacheTtl: 3600 });
+        if (buffer) {
+          const domains = decode(new Uint8Array(buffer));
+          const set = new Set(domains);
           if (set.size > 0) {
             blocklistSet = set;
             nextRefreshTime = now + CACHE_TTL;
-            console.log(`KV: ${set.size} domen.`);
+            console.log(`KV (bin): ${set.size} domen.`);
             return;
           }
         }
       }
     } catch (err) {
-      console.error("KV:", err);
+      console.error("KV (bin):", err);
     }
 
-    // 2. fallback: github
+    // 2. fallback: github (bin)
     try {
-      const res = await fetch(BLOCKLIST_URL, { headers: { "User-Agent": "doh-worker/1.0" } });
+      const res = await fetch(BLOCKLIST_BIN_URL, { headers: { "User-Agent": "doh-worker/1.0" } });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
-      const set = parseBlocklist(await res.text());
+      const buffer = await res.arrayBuffer();
+      const domains = decode(new Uint8Array(buffer));
+      const set = new Set(domains);
+
       if (set.size > 0) {
         blocklistSet = set;
         nextRefreshTime = now + CACHE_TTL;
-        console.log(`GitHub: ${set.size} domen.`);
+        console.log(`GitHub (bin): ${set.size} domen.`);
       } else {
         nextRefreshTime = now + ERROR_RETRY_TTL;
       }
     } catch (err) {
-      console.error("GitHub:", err);
+      console.error("GitHub (bin):", err);
       nextRefreshTime = now + ERROR_RETRY_TTL;
     }
   })();
