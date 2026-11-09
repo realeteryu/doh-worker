@@ -112,16 +112,38 @@ function extractDomainFromDNS(buffer) {
   }
 }
 
-function buildNxdomainWireFormat(buf) {
-  const fallback = () => new Uint8Array([0,0,0x81,0x83,0,0,0,0,0,0,0,0]);
-  if (!buf || buf.byteLength < 12) return fallback();
-  const qdcount = (buf[4] << 8) | buf[5];
-  if (qdcount === 0 || buf.byteLength < 17) {
-    const f = fallback();
-    f[0] = buf[0]; f[1] = buf[1];
-    return f;
+// offset końca sekcji pytania (QNAME + QTYPE + QCLASS) lub -1.
+function findQuestionEnd(buf) {
+  let offset = 12;
+  const len = buf.byteLength;
+  let safety = 0;
+  while (offset < len && safety < 128) {
+    safety++;
+    const l = buf[offset];
+    if (l === 0) {
+      offset++;
+      if (offset + 4 > len) return -1;
+      return offset + 4;
+    }
+    if ((l & 0xC0) !== 0) return -1; // kompresja w pytaniu – nieoczekiwane
+    offset += 1 + l;
+    if (offset > len) return -1;
   }
-  const out = new Uint8Array(buf);
+  return -1;
+}
+
+function buildNxdomainWireFormat(buf) {
+  const fallback = () => {
+    const f = new Uint8Array([0,0,0x81,0x83,0,0,0,0,0,0,0,0]);
+    if (buf && buf.byteLength >= 2) { f[0] = buf[0]; f[1] = buf[1]; }
+    return f;
+  };
+  if (!buf || buf.byteLength < 17) return fallback();
+  const qdcount = (buf[4] << 8) | buf[5];
+  if (qdcount !== 1) return fallback();
+  const qEnd = findQuestionEnd(buf);
+  if (qEnd === -1) return fallback();
+  const out = buf.slice(0, qEnd);
   out[2] = (buf[2] & 0x01) | 0x80;
   out[3] = 0x83;
   out[6] = 0; out[7] = 0;
@@ -130,43 +152,21 @@ function buildNxdomainWireFormat(buf) {
 }
 
 function buildServfailWireFormat(buf) {
-  const fallback = () => new Uint8Array([0,0,0x81,0x82,0,0,0,0,0,0,0,0]);
-  if (!buf || buf.byteLength < 12) return fallback();
-  const out = new Uint8Array(buf);
+  const fallback = () => {
+    const f = new Uint8Array([0,0,0x81,0x82,0,0,0,0,0,0,0,0]);
+    if (buf && buf.byteLength >= 2) { f[0] = buf[0]; f[1] = buf[1]; }
+    return f;
+  };
+  if (!buf || buf.byteLength < 17) return fallback();
+  const qdcount = (buf[4] << 8) | buf[5];
+  if (qdcount !== 1) return fallback();
+  const qEnd = findQuestionEnd(buf);
+  if (qEnd === -1) return fallback();
+  const out = buf.slice(0, qEnd);
   out[2] = (buf[2] & 0x01) | 0x80;
   out[3] = 0x82;
   out[6] = 0; out[7] = 0;
   out[8] = 0; out[9] = 0;
-  return out;
-}
-
-function buildNxdomainResponseForDomain(domainName, qtype = 1) {
-  const clean = normalizeDomain(domainName);
-  const encoder = new TextEncoder();
-  const labels = [];
-  for (const l of clean.split('.')) {
-    if (!l) continue;
-    const b = encoder.encode(l);
-    if (b.length > 0 && b.length <= 63) labels.push(b);
-  }
-  let qnameLen = 1;
-  for (const b of labels) qnameLen += b.length + 1;
-
-  const out = new Uint8Array(12 + qnameLen + 4);
-  out[2] = 0x81; out[3] = 0x83;
-  out[5] = 0x01;
-
-  let o = 12;
-  for (const b of labels) {
-    out[o++] = b.length;
-    out.set(b, o);
-    o += b.length;
-  }
-  out[o++] = 0;
-  out[o++] = (qtype >> 8) & 0xFF;
-  out[o++] = qtype & 0xFF;
-  out[o++] = 0;
-  out[o++] = 1;
   return out;
 }
 
@@ -212,23 +212,19 @@ export default {
       ctx.waitUntil(loadBlocklist(env));
     }
 
-    let domainName = "";
     let queryBuffer = null;
 
     if (request.method === "GET") {
       const dns = url.searchParams.get("dns");
-      if (dns) {
-        try {
-          let b64 = dns.replace(/-/g, '+').replace(/_/g, '/');
-          while (b64.length % 4) b64 += '=';
-          const bin = atob(b64);
-          queryBuffer = new Uint8Array(bin.length);
-          for (let i = 0; i < bin.length; i++) queryBuffer[i] = bin.charCodeAt(i);
-        } catch {
-          return new Response("Bad Request", { status: 400 });
-        }
-      } else {
-        domainName = url.searchParams.get("name") || "";
+      if (!dns) return new Response("Bad Request: missing dns parameter", { status: 400 });
+      try {
+        let b64 = dns.replace(/-/g, '+').replace(/_/g, '/');
+        while (b64.length % 4) b64 += '=';
+        const bin = atob(b64);
+        queryBuffer = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) queryBuffer[i] = bin.charCodeAt(i);
+      } catch {
+        return new Response("Bad Request", { status: 400 });
       }
     } else if (request.method === "POST") {
       queryBuffer = new Uint8Array(await request.arrayBuffer());
@@ -239,17 +235,13 @@ export default {
       });
     }
 
-    if (queryBuffer && queryBuffer.byteLength > MAX_DNS_SIZE)
+    if (queryBuffer.byteLength > MAX_DNS_SIZE)
       return new Response("DNS query too large", { status: 400 });
 
-    if (queryBuffer) domainName = extractDomainFromDNS(queryBuffer);
+    const domainName = extractDomainFromDNS(queryBuffer);
 
     if (domainName && isBlocked(domainName, blocklistSet)) {
-      const responseBuffer = queryBuffer
-        ? buildNxdomainWireFormat(queryBuffer)
-        : buildNxdomainResponseForDomain(domainName, parseInt(url.searchParams.get("type")) || 1);
-
-      return new Response(responseBuffer, {
+      return new Response(buildNxdomainWireFormat(queryBuffer), {
         headers: {
           "Content-Type": "application/dns-message",
           "Cache-Control": "public, max-age=300",
@@ -261,15 +253,12 @@ export default {
       return await fetchUpstream(upstream, request, queryBuffer);
     } catch (err) {
       console.error("upstream:", err);
-      if (queryBuffer) {
-        return new Response(buildServfailWireFormat(queryBuffer), {
-          headers: {
-            "Content-Type": "application/dns-message",
-            "Cache-Control": "no-store",
-          },
-        });
-      }
-      return new Response("Bad Gateway", { status: 502 });
+      return new Response(buildServfailWireFormat(queryBuffer), {
+        headers: {
+          "Content-Type": "application/dns-message",
+          "Cache-Control": "no-store",
+        },
+      });
     }
   },
 };
