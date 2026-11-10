@@ -6,9 +6,6 @@ const CACHE_TTL = 3600 * 1000;         // 1 godzina
 const ERROR_RETRY_TTL = 5 * 60 * 1000; // 5 minut po błędzie
 const UPSTREAM_TIMEOUT = 8000;         // 8 sekund
 const MAX_DNS_SIZE = 4096;             // 512 UDP + bufor EDNS0
-const CACHE_NAME = "doh-cache-v1";     // nazwa cache
-const MIN_TTL = 30;                    // sekundy – dolny limit TTL w cache
-const MAX_TTL = 3600;                  // sekundy – górny limit TTL w cache
 
 let blocklistSet = new Set();
 let nextRefreshTime = 0;
@@ -173,40 +170,6 @@ function buildServfailWireFormat(buf) {
   return out;
 }
 
-// minimalny TTL z sekcji Answer odpowiedzi DNS (lub null).
-function parseMinTTLFromDNS(buffer) {
-  if (!buffer || buffer.byteLength < 12) return null;
-  const an = (buffer[6] << 8) | buffer[7];
-  if (an === 0) return null;
-
-  let offset = 12;
-  // pomiń QNAME
-  while (offset < buffer.byteLength) {
-    const l = buffer[offset];
-    if (l === 0) { offset++; break; }
-    if ((l & 0xC0) === 0xC0) { offset += 2; break; }
-    offset += 1 + l;
-  }
-  offset += 4; // QTYPE + QCLASS
-
-  let minTTL = null;
-  for (let i = 0; i < an && offset + 12 <= buffer.byteLength; i++) {
-    // pomiń NAME (może być pointer)
-    if ((buffer[offset] & 0xC0) === 0xC0) offset += 2;
-    else { while (offset < buffer.byteLength && buffer[offset] !== 0) offset += 1 + buffer[offset]; offset++; }
-    if (offset + 10 > buffer.byteLength) break;
-    const ttl = (buffer[offset+4] << 24) | (buffer[offset+5] << 16) | (buffer[offset+6] << 8) | buffer[offset+7];
-    if (minTTL === null || ttl < minTTL) minTTL = ttl;
-    offset += 10 + ((buffer[offset+8] << 8) | buffer[offset+9]); // RDLENGTH
-  }
-  return minTTL;
-}
-
-function cacheKeyForDNS(url) {
-  const dns = url.searchParams.get("dns");
-  return new Request(`https://cache.local${url.pathname}?dns=${encodeURIComponent(dns)}`, { method: "GET" });
-}
-
 async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   const isPost = request.method === "POST";
   const headers = new Headers(request.headers);
@@ -286,41 +249,6 @@ export default {
       });
     }
 
-    // cache tylko dla GET (POST nie jest cache'owalny przez Cache API)
-    if (request.method === "GET" && queryBuffer) {
-      const cache = caches.default;
-      const key = cacheKeyForDNS(url);
-
-      const hit = await cache.match(key);
-      if (hit) return hit;
-
-      try {
-        const upstreamRes = await fetchUpstream(upstream, request, queryBuffer);
-        if (!upstreamRes.ok) return upstreamRes;
-
-        const cloned = upstreamRes.clone();
-        const buf = new Uint8Array(await cloned.arrayBuffer());
-        const ttl = parseMinTTLFromDNS(buf);
-        const maxAge = Math.max(MIN_TTL, Math.min(MAX_TTL, ttl ?? MIN_TTL));
-
-        const headers = new Headers(upstreamRes.headers);
-        headers.set("Cache-Control", `public, max-age=${maxAge}`);
-        const toCache = new Response(buf, { status: upstreamRes.status, headers });
-
-        ctx.waitUntil(cache.put(key, toCache));
-        return upstreamRes;
-      } catch (err) {
-        console.error("upstream:", err);
-        return new Response(buildServfailWireFormat(queryBuffer), {
-          headers: {
-            "Content-Type": "application/dns-message",
-            "Cache-Control": "no-store",
-          },
-        });
-      }
-    }
-
-    // POST – bez cache
     try {
       return await fetchUpstream(upstream, request, queryBuffer);
     } catch (err) {
