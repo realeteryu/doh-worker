@@ -200,6 +200,12 @@ async function fetchUpstream(upstreamUrl, request, queryBuffer) {
 }
 
 export default {
+  // cron: utrzymuje ciepły isolate i świeżą bloklistę poza ścieżką żądań
+  async scheduled(controller, env, ctx) {
+    await loadBlocklist(env);
+    console.log(`Cron: blocklist refreshed at ${new Date().toISOString()}`);
+  },
+
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
     const upstream = env?.UPSTREAM_DOH || DEFAULT_UPSTREAM;
