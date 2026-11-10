@@ -8,5 +8,8 @@
       "binding": "DNS_KV",
       "id": "1ce4daa59e534332a3ebbb16c3eef56b"
     }
-  ]
+  ],
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  }
 }
