@@ -177,6 +177,9 @@ async function fetchUpstream(upstreamUrl, request, queryBuffer) {
   headers.delete("cf-connecting-ip");
   headers.delete("cf-ray");
   headers.delete("cf-ipcountry");
+  headers.delete("x-real-ip");
+  headers.delete("cf-visitor");
+  headers.delete("connection");
   if (!isPost) {
     headers.delete("content-type");
     headers.delete("content-length");
