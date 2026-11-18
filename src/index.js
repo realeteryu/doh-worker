@@ -1,7 +1,6 @@
 import { decode } from '@msgpack/msgpack';
 
-const BLOCKLIST_BIN_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_combined.msgpack";
-const ALLOWLIST_BIN_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_allowlist.msgpack";
+const POLICY_BIN_URL = "https://raw.githubusercontent.com/realeteryu/dns-blocklists/refs/heads/main/output/doh_policy.msgpack";
 
 const DEFAULT_UPSTREAM = "https://cloudflare-dns.com/dns-query";
 const CACHE_TTL = 3600 * 1000;
@@ -23,16 +22,14 @@ function normalizeDomain(domain) {
   return domain.trim().toLowerCase().replace(/\.$/, "");
 }
 
-function decodeDomainList(buffer, name, allowEmpty = false) {
-  const decoded = decode(new Uint8Array(buffer));
-
-  if (!Array.isArray(decoded)) {
-    throw new Error(`${name}: nieprawidłowy format danych`);
+function decodeDomainList(list, name, allowEmpty = false) {
+  if (!Array.isArray(list)) {
+    throw new Error(`${name}: nieprawidłowy format listy`);
   }
 
   const domains = new Set();
 
-  for (const item of decoded) {
+  for (const item of list) {
     if (typeof item !== "string") {
       throw new Error(`${name}: wpis nie jest tekstem`);
     }
@@ -57,6 +54,10 @@ function decodeDomainList(buffer, name, allowEmpty = false) {
       throw new Error(`${name}: domena nie jest znormalizowana: ${item}`);
     }
 
+    if (domains.has(domain)) {
+      throw new Error(`${name}: powtórzona domena: ${domain}`);
+    }
+
     domains.add(domain);
   }
 
@@ -65,6 +66,43 @@ function decodeDomainList(buffer, name, allowEmpty = false) {
   }
 
   return domains;
+}
+
+function decodePolicy(buffer, name) {
+  const decoded = decode(new Uint8Array(buffer));
+
+  if (
+    !decoded ||
+    typeof decoded !== "object" ||
+    Array.isArray(decoded)
+  ) {
+    throw new Error(`${name}: nieprawidłowa struktura polityki`);
+  }
+
+  const keys = Object.keys(decoded).sort();
+
+  if (
+    keys.length !== 2 ||
+    keys[0] !== "allowlist" ||
+    keys[1] !== "blocklist"
+  ) {
+    throw new Error(`${name}: polityka musi zawierać tylko blocklist i allowlist`);
+  }
+
+  const blocks = decodeDomainList(
+    decoded.blocklist,
+    `${name} blocklist`
+  );
+
+  const allows = decodeDomainList(
+    decoded.allowlist,
+    `${name} allowlist`,
+    true
+  );
+
+  validateLists(blocks, allows);
+
+  return { blocks, allows };
 }
 
 function validateLists(blocks, allows) {
@@ -85,36 +123,22 @@ async function loadBlocklist(env) {
 
     if (now < nextRefreshTime) return;
 
-    // 1. Próba pobrania obu list z Cloudflare KV.
+    // 1. Próba pobrania połączonej polityki z Cloudflare KV.
     try {
       if (env?.DNS_KV) {
-        const [blockBuffer, allowBuffer] = await Promise.all([
-          env.DNS_KV.get("blocklist_bin", {
-            type: "arrayBuffer",
-            cacheTtl: 60,
-          }),
-          env.DNS_KV.get("allowlist_bin", {
-            type: "arrayBuffer",
-            cacheTtl: 60,
-          }),
-        ]);
+        const policyBuffer = await env.DNS_KV.get("policy_bin", {
+          type: "arrayBuffer",
+          cacheTtl: 60,
+        });
 
-        if (!blockBuffer || !allowBuffer) {
-          throw new Error("Brak jednej lub obu list w Cloudflare KV");
+        if (!policyBuffer) {
+          throw new Error("Brak polityki w Cloudflare KV");
         }
 
-        const blocks = decodeDomainList(
-          blockBuffer,
-          "KV blocklist"
+        const { blocks, allows } = decodePolicy(
+          policyBuffer,
+          "KV policy"
         );
-
-        const allows = decodeDomainList(
-          allowBuffer,
-          "KV allowlist",
-          true
-        );
-
-        validateLists(blocks, allows);
 
         // Podmieniamy obie listy dopiero po pełnej walidacji.
         blocklistSet = blocks;
@@ -132,42 +156,26 @@ async function loadBlocklist(env) {
       console.error("KV:", err);
     }
 
-    // 2. Fallback: obie listy z GitHub.
+    // 2. Fallback: połączona polityka z GitHub.
     try {
-      const [blockResponse, allowResponse] = await Promise.all([
-        fetch(BLOCKLIST_BIN_URL, {
-          headers: { "User-Agent": "doh-worker/1.0" },
-        }),
-        fetch(ALLOWLIST_BIN_URL, {
-          headers: { "User-Agent": "doh-worker/1.0" },
-        }),
-      ]);
+      const response = await fetch(POLICY_BIN_URL, {
+        headers: { "User-Agent": "doh-worker/1.0" },
+      });
 
-      if (!blockResponse.ok) {
-        throw new Error(`GitHub blocklist HTTP ${blockResponse.status}`);
+      if (!response.ok) {
+        throw new Error(`GitHub policy HTTP ${response.status}`);
       }
 
-      if (!allowResponse.ok) {
-        throw new Error(`GitHub allowlist HTTP ${allowResponse.status}`);
+      const policyBuffer = await response.arrayBuffer();
+
+      if (policyBuffer.byteLength === 0) {
+        throw new Error("GitHub policy: pobrany plik jest pusty");
       }
 
-      const [blockBuffer, allowBuffer] = await Promise.all([
-        blockResponse.arrayBuffer(),
-        allowResponse.arrayBuffer(),
-      ]);
-
-      const blocks = decodeDomainList(
-        blockBuffer,
-        "GitHub blocklist"
+      const { blocks, allows } = decodePolicy(
+        policyBuffer,
+        "GitHub policy"
       );
-
-      const allows = decodeDomainList(
-        allowBuffer,
-        "GitHub allowlist",
-        true
-      );
-
-      validateLists(blocks, allows);
 
       blocklistSet = blocks;
       allowlistSet = allows;
@@ -238,6 +246,8 @@ function extractDomainFromDNS(buffer) {
         continue;
       }
 
+      if (len > 63) break;
+
       offset++;
 
       if (offset + len > buffer.byteLength) break;
@@ -275,6 +285,8 @@ function findQuestionEnd(buf) {
     }
 
     if ((l & 0xC0) !== 0) return -1;
+
+    if (l > 63) return -1;
 
     offset += 1 + l;
 
@@ -401,12 +413,12 @@ async function fetchUpstream(upstreamUrl, request, queryBuffer) {
 }
 
 export default {
-  // Cron okresowo odświeża listy poza ścieżką żądań DNS.
+  // Cron okresowo odświeża politykę poza ścieżką żądań DNS.
   async scheduled(controller, env, ctx) {
     await loadBlocklist(env);
 
     console.log(
-      `Cron: listy odświeżone ${new Date().toISOString()}`
+      `Cron: polityka odświeżona ${new Date().toISOString()}`
     );
   },
 
@@ -469,6 +481,12 @@ export default {
 
     if (queryBuffer.byteLength > MAX_DNS_SIZE) {
       return new Response("DNS query too large", { status: 400 });
+    }
+
+    if (queryBuffer.byteLength < 12) {
+      return new Response("Bad Request: invalid DNS message", {
+        status: 400,
+      });
     }
 
     const domainName = extractDomainFromDNS(queryBuffer);
